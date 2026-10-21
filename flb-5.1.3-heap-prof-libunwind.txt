@@ -1,0 +1,8 @@
+env:
+  - name: POD_NAME
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.name
+
+  - name: MALLOC_CONF
+    value: "prof:true,prof_active:true,lg_prof_sample:19,lg_prof_interval:40,prof_gdump:false,prof_final:false,prof_accum:false,prof_prefix:/var/log/fluent-bit-heap-profiles/$(POD_NAME),confirm_conf:true"
