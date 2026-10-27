@@ -1,8 +1,0 @@
-Decision Driver	Option A (Selected)	Option B
-Business and Regulatory Alignment	Meets objectives through centralized Linux logging in LaaS, subject to control validation	Meets the same objectives through an independent collection pipeline, subject to control validation
-Minimal Infrastructure Changes	Strong – Reuses Rsyslog servers without client-side changes or additional collectors	Less favorable – Requires dedicated collectors, Fluent-Bit configuration updates, and firewall changes
-Availability and Resilience	Moderate – Depends on centralized Rsyslog; supports recovery from persisted log files	Stronger potential – Independent of centralized Rsyslog, with Collector HA and buffering
-Resource Efficiency and Cost	High efficiency – Minimal additional infrastructure and network overhead	Lower efficiency – Additional servers, network traffic, and operational resources
-Scalability and Performance	Moderate – Depends on Rsyslog capacity, file count, and Tail performance	Higher scaling potential – Dedicated Collectors can scale independently, but add network and processing overhead
-Security and Multi-Tenancy	Supported through dedicated SystemID and validated tenant mapping	Supported through Collector-based tenant mapping and dedicated SystemID
-Operational Supportability	Simpler – Centralized configuration, fewer components, and straightforward rollback	More complex – Distributed agent configuration, Collector maintenance, HA monitoring, and additional dependencies
