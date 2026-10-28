@@ -1,0 +1,24 @@
+for pod in fluent-bit-4w5nm fluent-bit-qxptl fluent-bit-sq4ck; do
+  echo "========== $pod =========="
+
+  kubectl exec "$pod" -c fluent-bit -- sh -c '
+    echo "=== ACTUAL ENV ==="
+    tr "\000" "\n" < /proc/1/environ |
+      grep -E "^(POD_NAME|MALLOC_CONF)=" || true
+
+    echo "=== ALL HEAP FILES ==="
+
+    DIR=/var/log/fluent-bit-heap-profiles
+
+    if [ -d "$DIR" ]; then
+      find "$DIR" -maxdepth 1 -type f -name "*.heap" \
+        -printf "%TY-%Tm-%Td %TH:%TM:%TS %s bytes %f\n" |
+        sort | tail -20
+
+      echo "=== TOTAL HEAP COUNT ==="
+      find "$DIR" -maxdepth 1 -type f -name "*.heap" | wc -l
+    else
+      echo "PROFILE DIRECTORY MISSING"
+    fi
+  '
+done

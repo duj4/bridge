@@ -1,0 +1,42 @@
+cp -p flb-heap-diagnostic.sh \
+  "flb-heap-diagnostic.sh.bak.$(date +%Y%m%d%H%M%S)"
+
+python3 - <<'PY'
+from pathlib import Path
+
+p = Path("flb-heap-diagnostic.sh")
+s = p.read_text()
+
+old = '-name "${POD}.*.i*.heap"'
+new = '-name "${PROFILE_BASENAME}.*.i*.heap"'
+
+assert s.count(old) == 1, "Unexpected script structure"
+assert s.count('PROFILES="$(') == 1, "Unexpected profile block"
+
+setup = r'''
+# Derive the actual file prefix from PID 1 MALLOC_CONF.
+PROF_PREFIX="$(
+    printf '%s\n' "$MALLOC_CONF_TEXT" |
+    sed -n 's/.*prof_prefix:\([^,]*\).*/\1/p'
+)"
+
+PROFILE_BASENAME="${PROF_PREFIX##*/}"
+
+if [ -z "$PROFILE_BASENAME" ]; then
+    PROFILE_BASENAME="$POD"
+fi
+
+echo "Effective profile prefix: ${PROF_PREFIX:-unknown}"
+echo "Expected file basename: $PROFILE_BASENAME"
+
+'''
+
+s = s.replace('PROFILES="$(', setup + 'PROFILES="$(', 1)
+s = s.replace(old, new, 1)
+
+p.write_text(s)
+print("Diagnostic script updated.")
+PY
+
+bash -n flb-heap-diagnostic.sh &&
+  echo "BASH SYNTAX PASSED"
