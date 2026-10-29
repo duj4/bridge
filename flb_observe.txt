@@ -1,0 +1,571 @@
+cat > flb-observe.sh <<'SCRIPT'
+#!/usr/bin/env bash
+# Fluent Bit 5.1.x: read-only memory/VMA/runtime diagnostics.
+set -Eeuo pipefail
+umask 077
+
+MODE="${1:-collect}"
+ROOT="${ROOT:-$HOME/flb-observations}"
+NS="${NS:-}"
+K=(kubectl)
+[[ -z "$NS" ]] || K+=(-n "$NS")
+
+fail() { echo "ERROR: $*" >&2; exit 1; }
+command -v kubectl >/dev/null || fail "kubectl is missing"
+command -v python3 >/dev/null || fail "python3 is missing on jump host"
+mkdir -p "$ROOT"
+
+collect() {
+  local stamp dir pod info
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  dir="$ROOT/$stamp"
+  mkdir -p "$dir"
+
+  if [[ -n "${PODS:-}" ]]; then
+    read -r -a pods <<< "$PODS"
+  else
+    mapfile -t pods < <(
+      "${K[@]}" get pods \
+        -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\n"}{end}' |
+        awk '$1 ~ /^fluent-bit-[a-z0-9]+$/ && $2 == "Running" {print $1}' |
+        sort
+    )
+  fi
+
+  ((${#pods[@]} > 0)) || fail "No running fluent-bit-* pods found"
+
+  echo "Collected UTC: $stamp"
+  echo "Namespace: ${NS:-<current kubectl namespace>}"
+  echo "Pods: ${pods[*]}"
+  echo "Snapshot directory: $dir"
+
+  printf 'pod\tuid\tnode\tcontainerID\tstartedAt\trestarts\timage\n' \
+    > "$dir/identity.tsv"
+
+  for pod in "${pods[@]}"; do
+    echo "  $pod ..."
+    mkdir -p "$dir/$pod"
+
+    info="$(
+      "${K[@]}" get pod "$pod" \
+        -o jsonpath='{.metadata.uid}{"\t"}{.spec.nodeName}{"\t"}{.status.containerStatuses[?(@.name=="fluent-bit")].containerID}{"\t"}{.status.containerStatuses[?(@.name=="fluent-bit")].state.running.startedAt}{"\t"}{.status.containerStatuses[?(@.name=="fluent-bit")].restartCount}{"\t"}{.spec.containers[?(@.name=="fluent-bit")].image}'
+    )"
+
+    [[ -n "$info" ]] || fail "Cannot resolve container identity: $pod"
+    printf '%s\t%s\n' "$pod" "$info" >> "$dir/identity.tsv"
+
+    # ========================================================
+    # Process + cgroup memory
+    # ========================================================
+
+    "${K[@]}" exec -i "$pod" -c fluent-bit -- sh -s \
+      > "$dir/$pod/memory.tsv" <<'IN_POD_MEM'
+
+printf 'metric\tvalue\n'
+
+getproc() {
+  awk -v k="$1:" '$1==k {print $2; exit}' "$2" 2>/dev/null
+}
+
+output() {
+  [ -z "$2" ] || printf '%s\t%s\n' "$1" "$2"
+}
+
+for k in VmRSS RssAnon VmSize Threads; do
+  output "proc_${k}" "$(getproc "$k" /proc/1/status)"
+done
+
+for k in Rss Pss Anonymous Private_Dirty AnonHugePages LazyFree; do
+  output "smaps_${k}_kB" \
+    "$(getproc "$k" /proc/1/smaps_rollup)"
+done
+
+output "fd_count" \
+  "$(ls /proc/1/fd 2>/dev/null | wc -l | tr -d ' ')"
+
+output "storage_kB" \
+  "$(du -sk /var/log/fluent-bit-storage 2>/dev/null | awk '{print $1}')"
+
+CG_REL="$(sed -n 's/^0:://p' /proc/1/cgroup)"
+CG="/sys/fs/cgroup${CG_REL}"
+
+[ -r "$CG/memory.current" ] || CG=/sys/fs/cgroup
+
+for k in memory.current memory.peak memory.max; do
+  [ ! -r "$CG/$k" ] ||
+    output "cgroup_${k}" "$(cat "$CG/$k")"
+done
+
+if [ -r "$CG/memory.stat" ]; then
+  for k in \
+    anon file kernel anon_thp \
+    slab_reclaimable slab_unreclaimable slab \
+    inactive_file active_file sock pagetables
+  do
+    output "cgroup_${k}_bytes" \
+      "$(awk -v k="$k" '$1==k {print $2; exit}' "$CG/memory.stat")"
+  done
+fi
+
+if [ -r "$CG/memory.events" ]; then
+  for k in max oom oom_kill high; do
+    output "events_$k" \
+      "$(awk -v k="$k" '$1==k {print $2; exit}' "$CG/memory.events")"
+  done
+fi
+
+IN_POD_MEM
+
+    # ========================================================
+    # Anonymous memory mappings
+    # ========================================================
+
+    "${K[@]}" exec -i "$pod" -c fluent-bit -- sh -s \
+      > "$dir/$pod/mappings.tsv" <<'IN_POD_MAP'
+
+awk '
+BEGIN {
+  print "range\tperms\tmapping\tSize_kB\tRss_kB\tAnonymous_kB\tPrivateDirty_kB\tAnonHugePages_kB\tVmFlags"
+}
+
+function emit() {
+  if (seen) {
+    gsub(/\t/, " ", name)
+    printf "%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%s\n",
+      range, perms, name, sz, rss, anon, dirty, thp, flags
+  }
+}
+
+/^[0-9a-fA-F]+-[0-9a-fA-F]+[[:space:]]/ {
+  emit()
+  seen=1
+  range=$1
+  perms=$2
+  name=""
+
+  for (i=6; i<=NF; i++)
+    name=name (i==6?"":" ") $i
+
+  if (name=="")
+    name="[anonymous]"
+
+  sz=rss=anon=dirty=thp=0
+  flags=""
+  next
+}
+
+$1=="Size:"          {sz=$2; next}
+$1=="Rss:"           {rss=$2; next}
+$1=="Anonymous:"     {anon=$2; next}
+$1=="Private_Dirty:" {dirty=$2; next}
+$1=="AnonHugePages:" {thp=$2; next}
+$1=="VmFlags:"       {flags=substr($0,10); next}
+
+END {emit()}
+' /proc/1/smaps
+
+IN_POD_MAP
+
+    # ========================================================
+    # Fluent Bit Metrics
+    # ========================================================
+
+    if "${K[@]}" exec "$pod" -c fluent-bit -- \
+      curl -fsS --max-time 10 \
+        http://127.0.0.1:2020/api/v2/metrics/prometheus \
+      > "$dir/$pod/metrics.prom"; then
+
+      python3 - \
+        "$dir/$pod/metrics.prom" \
+        "$dir/$pod/metrics.tsv" \
+        "$dir/$pod/metrics-instances.tsv" <<'PYMETRICS'
+
+import re
+import sys
+import collections
+
+src, dst, inst = sys.argv[1:]
+agg = collections.defaultdict(float)
+perinst = collections.defaultdict(float)
+
+rx = re.compile(
+    r'^([A-Za-z_:][A-Za-z0-9_:]*)(?:\{.*\})?\s+([-+0-9.eE]+)(?:\s+.*)?$'
+)
+
+for line in open(src, encoding="utf8", errors="replace"):
+    if not line or line.startswith("#"):
+        continue
+
+    m = rx.match(line.strip())
+    if not m:
+        continue
+
+    key, val = m.groups()
+
+    if not key.startswith("fluentbit_"):
+        continue
+
+    if key.endswith(("_bucket", "_sum", "_count")):
+        continue
+
+    if not any(
+        key.startswith(p)
+        for p in (
+            "fluentbit_input_",
+            "fluentbit_output_",
+            "fluentbit_filter_",
+            "fluentbit_storage_",
+        )
+    ):
+        continue
+
+    try:
+        value = float(val)
+    except ValueError:
+        continue
+
+    agg[key] += value
+
+    label = re.search(r'(?:\{|,)name="([^"\n]*)"', line)
+
+    if label:
+        name = label.group(1).replace("\t", " ").replace("\n", " ")
+        perinst[(key, name)] += value
+
+with open(dst, "w") as f:
+    f.write("metric\tvalue\n")
+    for k in sorted(agg):
+        f.write(f"{k}\t{agg[k]:.15g}\n")
+
+with open(inst, "w") as f:
+    f.write("metric\tname\tvalue\n")
+    for k, n in sorted(perinst):
+        f.write(f"{k}\t{n}\t{perinst[(k,n)]:.15g}\n")
+
+PYMETRICS
+
+    else
+      echo "WARNING: Metrics unavailable on $pod" >&2
+      printf 'metric\tvalue\n' > "$dir/$pod/metrics.tsv"
+      printf 'metric\tname\tvalue\n' \
+        > "$dir/$pod/metrics-instances.tsv"
+    fi
+
+    # Confirm that Fluent Bit did not restart while collecting.
+    current_cid="$(
+      "${K[@]}" get pod "$pod" \
+        -o jsonpath='{.status.containerStatuses[?(@.name=="fluent-bit")].containerID}'
+    )"
+
+    original_cid="$(printf '%s' "$info" | cut -f3)"
+
+    if [[ "$current_cid" != "$original_cid" ]]; then
+      echo "WARNING: $pod restarted during capture" >&2
+      touch "$dir/$pod/UNSTABLE"
+    fi
+  done
+
+  echo "Saved: $dir"
+  echo "Next: collect again, then run comparison"
+}
+
+compare() {
+  local old new
+
+  if (($# == 2)); then
+    old="$1"
+    new="$2"
+  elif (($# == 0)); then
+    mapfile -t dirs < <(
+      find "$ROOT" -mindepth 1 -maxdepth 1 -type d \
+        -name '20??????T??????Z' \
+        -printf '%f\n' | sort
+    )
+
+    ((${#dirs[@]} >= 2)) || fail "Need at least two snapshots"
+
+    old="$ROOT/${dirs[0]}"
+    new="$ROOT/${dirs[${#dirs[@]}-1]}"
+  else
+    fail "Usage: $0 compare [OLD_DIR NEW_DIR]"
+  fi
+
+  [[ -f "$old/identity.tsv" && -f "$new/identity.tsv" ]] ||
+    fail "Invalid snapshot pair"
+
+  outfile="$new/compare-vs-$(basename "$old").txt"
+
+  python3 - "$old" "$new" <<'PYCOMPARE' | tee "$outfile"
+
+import sys
+import csv
+import datetime
+from pathlib import Path
+
+old, new = map(Path, sys.argv[1:])
+
+def readtsv(path, key):
+    with open(path, encoding="utf8") as f:
+        return {
+            row[key]: row
+            for row in csv.DictReader(f, delimiter="\t")
+        }
+
+def values(path):
+    try:
+        return {
+            k: float(v["value"])
+            for k, v in readtsv(path, "metric").items()
+            if v["value"] != "max"
+        }
+    except FileNotFoundError:
+        return {}
+
+ia = readtsv(old / "identity.tsv", "pod")
+ib = readtsv(new / "identity.tsv", "pod")
+
+dt = (
+    datetime.datetime.strptime(new.name, "%Y%m%dT%H%M%SZ")
+    - datetime.datetime.strptime(old.name, "%Y%m%dT%H%M%SZ")
+).total_seconds()
+
+print("=== FLUENT BIT COMPARISON ===")
+print("OLD:", old)
+print("NEW:", new)
+print(f"Interval: {dt/3600:.2f} hours")
+
+memory_keys = [
+    "proc_VmRSS",
+    "proc_RssAnon",
+    "smaps_Anonymous_kB",
+    "smaps_AnonHugePages_kB",
+    "smaps_Private_Dirty_kB",
+    "cgroup_memory.current",
+    "cgroup_memory.peak",
+    "cgroup_anon_bytes",
+    "cgroup_file_bytes",
+    "cgroup_slab_reclaimable_bytes",
+    "fd_count",
+    "events_max",
+    "events_oom",
+    "events_oom_kill",
+]
+
+counters = [
+    "fluentbit_input_bytes_total",
+    "fluentbit_input_records_total",
+    "fluentbit_input_files_opened_total",
+    "fluentbit_input_files_closed_total",
+    "fluentbit_input_files_rotated_total",
+    "fluentbit_output_proc_bytes_total",
+    "fluentbit_output_proc_records_total",
+    "fluentbit_output_errors_total",
+    "fluentbit_output_retries_total",
+    "fluentbit_output_retries_failed_total",
+    "fluentbit_output_dropped_records_total",
+    "fluentbit_output_retried_records_total",
+    "fluentbit_filter_drop_records_total",
+]
+
+gauges = [
+    "fluentbit_input_storage_chunks",
+    "fluentbit_input_storage_memory_bytes",
+    "fluentbit_input_storage_chunks_busy",
+    "fluentbit_input_storage_overlimit",
+    "fluentbit_output_upstream_busy_connections",
+    "fluentbit_output_upstream_total_connections",
+]
+
+for pod in sorted(set(ia) & set(ib)):
+    a, b = ia[pod], ib[pod]
+
+    print("\n" + "=" * 18, pod, "=" * 18)
+
+    changed = any(
+        a[k] != b[k]
+        for k in ("uid", "node", "containerID", "startedAt")
+    )
+
+    if (
+        changed
+        or (old / pod / "UNSTABLE").exists()
+        or (new / pod / "UNSTABLE").exists()
+    ):
+        print("SKIP: Container identity changed or restart detected")
+        continue
+
+    ma = values(old / pod / "memory.tsv")
+    mb = values(new / pod / "memory.tsv")
+
+    print("--- MEMORY DELTAS ---")
+
+    for k in memory_keys:
+        if k not in ma or k not in mb:
+            continue
+
+        v0, v1 = ma[k], mb[k]
+
+        if k.startswith("cgroup_"):
+            factor = 1048576
+        elif k.startswith(("proc_", "smaps_")):
+            factor = 1024
+        else:
+            factor = 1
+
+        if factor == 1:
+            print(f"{k:42s} {v0:.0f} -> {v1:.0f} ({v1-v0:+.0f})")
+        else:
+            print(
+                f"{k:42s} "
+                f"{v0/factor:.1f} -> {v1/factor:.1f} MiB "
+                f"({(v1-v0)/factor:+.1f} MiB)"
+            )
+
+    ra = values(old / pod / "metrics.tsv")
+    rb = values(new / pod / "metrics.tsv")
+
+    print("--- RUNTIME COUNTER DELTAS ---")
+
+    for k in counters:
+        if k not in ra or k not in rb:
+            continue
+
+        delta = rb[k] - ra[k]
+
+        if delta < 0:
+            print(f"{k}: COUNTER RESET / HOT RELOAD")
+        else:
+            rate = delta / dt if dt > 0 else 0
+            print(f"{k:48s} +{delta:,.0f} ({rate:.2f}/s)")
+
+    def instances(path):
+        if not path.exists():
+            return {}
+        with open(path, encoding="utf8") as f:
+            return {
+                (r["metric"], r["name"]): float(r["value"])
+                for r in csv.DictReader(f, delimiter="\t")
+            }
+
+    pa = instances(old / pod / "metrics-instances.tsv")
+    pb = instances(new / pod / "metrics-instances.tsv")
+
+    print("--- TOP PER-PLUGIN DELTAS ---")
+
+    for metric in (
+        "fluentbit_input_files_opened_total",
+        "fluentbit_input_files_rotated_total",
+        "fluentbit_input_bytes_total",
+        "fluentbit_output_proc_bytes_total",
+        "fluentbit_output_retries_total",
+        "fluentbit_output_errors_total",
+    ):
+        changes = sorted(
+            (
+                (pb[(m, n)] - v, n)
+                for (m, n), v in pa.items()
+                if m == metric and (m, n) in pb
+            ),
+            reverse=True,
+        )
+
+        if changes:
+            print(
+                metric + ": "
+                + ", ".join(
+                    f"{n}:{delta:+,.0f}"
+                    for delta, n in changes[:5]
+                )
+            )
+
+    print("--- CURRENT GAUGES ---")
+
+    for k in gauges:
+        if k in rb:
+            print(f"{k:48s} {rb[k]:,.0f}")
+
+    def readmap(path):
+        with open(path, encoding="utf8", errors="replace") as f:
+            return {
+                (r["range"], r["perms"], r["mapping"]): r
+                for r in csv.DictReader(f, delimiter="\t")
+            }
+
+    amap = readmap(old / pod / "mappings.tsv")
+    bmap = readmap(new / pod / "mappings.tsv")
+
+    entries = []
+
+    for key in amap.keys() | bmap.keys():
+        x, y = amap.get(key), bmap.get(key)
+
+        def get(d, field):
+            return float(d[field]) if d else 0
+
+        old_anon = get(x, "Anonymous_kB")
+        new_anon = get(y, "Anonymous_kB")
+        old_thp = get(x, "AnonHugePages_kB")
+        new_thp = get(y, "AnonHugePages_kB")
+
+        if old_anon == new_anon and old_thp == new_thp:
+            continue
+
+        status = (
+            "SAME" if x and y
+            else "NEW" if y
+            else "GONE"
+        )
+
+        entries.append((
+            new_anon - old_anon,
+            new_thp - old_thp,
+            status,
+            key[0],
+            key[2],
+        ))
+
+    print("--- TOP +20 ANONYMOUS MAPPING DELTAS ---")
+
+    for delta, thp, status, rng, name in sorted(
+        entries, reverse=True
+    )[:20]:
+        print(
+            f"{delta/1024:+8.2f} MiB "
+            f"THP={thp/1024:+7.2f} "
+            f"{status:4s} {rng} {name[:70]}"
+        )
+
+    print("--- TOP -8 ANONYMOUS MAPPING DELTAS ---")
+
+    for delta, thp, status, rng, name in sorted(entries)[:8]:
+        print(
+            f"{delta/1024:+8.2f} MiB "
+            f"THP={thp/1024:+7.2f} "
+            f"{status:4s} {rng} {name[:70]}"
+        )
+
+    print(
+        "VMA Anonymous total: "
+        f"{sum(float(x['Anonymous_kB']) for x in amap.values())/1024:.1f}"
+        " -> "
+        f"{sum(float(x['Anonymous_kB']) for x in bmap.values())/1024:.1f}"
+        " MiB"
+    )
+
+for pod in sorted(set(ia) ^ set(ib)):
+    print("UNPAIRED POD:", pod)
+
+PYCOMPARE
+
+  echo "Comparison saved: $outfile"
+}
+
+case "$MODE" in
+  collect|snapshot) collect ;;
+  compare) shift; compare "$@" ;;
+  *) fail "Usage: $0 [collect|compare [OLD_DIR NEW_DIR]]" ;;
+esac
+SCRIPT
+
+chmod +x flb-observe.sh
+bash -n flb-observe.sh && echo "SYNTAX PASSED"
