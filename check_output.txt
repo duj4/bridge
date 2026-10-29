@@ -1,0 +1,28 @@
+echo "===== CONTAINER IDENTITY ====="
+cat identity.tsv
+
+for dir in fluent-bit-*; do
+  echo
+  echo "========== $dir =========="
+
+  echo "=== FILE LINE COUNTS ==="
+  wc -l \
+    "$dir/memory.tsv" \
+    "$dir/mappings.tsv" \
+    "$dir/metrics.tsv" \
+    "$dir/metrics-instances.tsv"
+
+  echo "=== MEMORY BASELINE ==="
+  awk -F '\t' '
+    $1 ~ /^(proc_VmRSS|proc_RssAnon|smaps_Anonymous_kB|smaps_AnonHugePages_kB|cgroup_memory.current|cgroup_memory.max|events_oom_kill)$/ {
+      print $1 "=" $2
+    }
+  ' "$dir/memory.tsv"
+
+  echo "=== RUNTIME METRICS ==="
+  awk -F '\t' '
+    $1 ~ /^(fluentbit_input_bytes_total|fluentbit_input_records_total|fluentbit_output_proc_records_total|fluentbit_output_retries_total|fluentbit_output_upstream_total_connections)$/ {
+      print $1 "=" $2
+    }
+  ' "$dir/metrics.tsv"
+done
