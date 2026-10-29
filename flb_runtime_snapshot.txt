@@ -1,0 +1,36 @@
+cat > flb-runtime-snapshot.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+OUT="$HOME/flb-heap-reports/runtime-$(date -u +%Y%m%dT%H%M%SZ).txt"
+mkdir -p "$(dirname "$OUT")"
+
+for pod in fluent-bit-b9mkl fluent-bit-fxn8n fluent-bit-qfxfs; do
+
+  echo "===== $pod ====="
+
+  kubectl exec "$pod" -c fluent-bit -- \
+    curl -fsS --max-time 10 \
+    http://127.0.0.1:2020/api/v2/metrics/prometheus |
+  awk '
+    $1 ~ /^fluentbit_(input_bytes_total|input_records_total|output_proc_bytes_total|output_proc_records_total|output_retries_total|output_retries_failed_total|input_storage_memory_bytes|input_storage_chunks|output_upstream_total_connections|output_upstream_busy_connections)/ {
+      metric=$1
+      sub(/\{.*/, "", metric)
+      sum[metric]+=$NF
+    }
+
+    END {
+      for (metric in sum)
+        printf "%-54s %.0f\n", metric, sum[metric]
+    }
+  ' | sort
+
+  echo
+done | tee "$OUT"
+
+echo "Saved: $OUT"
+SH
+
+chmod +x flb-runtime-snapshot.sh
+./flb-runtime-snapshot.sh
