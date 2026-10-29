@@ -1,36 +1,38 @@
-# Backup previous version
 cp -p flb-jeprof-isolated.sh \
   "flb-jeprof-isolated.sh.bak.$(date +%Y%m%d%H%M%S)" \
   2>/dev/null || true
 
 cat > flb-jeprof-isolated.sh <<'SCRIPT'
 #!/usr/bin/env bash
-# One-shot, isolated jeprof analysis for a Fluent Bit pod on OpenShift.
+# Fluent Bit jeprof isolated analyzer v3
+# No hostPath: stream selected heap files between Pods.
+
 set -Eeuo pipefail
 umask 077
 
 TARGET="${1:-}"
-if [[ -z "$TARGET" ]]; then
-  echo "Usage: $0 <fluent-bit-pod>" >&2
-  echo "Optional: NS=fluent OUT_DIR=~/flb-heap-reports KEEP_POD=1 $0 <pod>" >&2
-  exit 2
-fi
-
 NS="${NS:-}"
 OUT_DIR="${OUT_DIR:-$HOME/flb-heap-reports}"
 KEEP_POD="${KEEP_POD:-0}"
-K=(kubectl)
-[[ -z "$NS" ]] || K+=(-n "$NS")
+PROFILE_DIR="${PROFILE_DIR:-/var/log/fluent-bit-heap-profiles}"
+
+if [[ ! "$TARGET" =~ ^fluent-bit-[a-z0-9]+$ ]]; then
+  echo "Usage: $0 fluent-bit-<pod-suffix>" >&2
+  exit 2
+fi
 
 command -v kubectl >/dev/null || {
-  echo "ERROR: kubectl not found" >&2
+  echo "ERROR: kubectl missing" >&2
   exit 1
 }
 
 mkdir -p "$OUT_DIR"
 
+K=(kubectl)
+[[ -z "$NS" ]] || K+=(-n "$NS")
+
 # ============================================================
-# 1. Read Target Fluent Bit Container Identity
+# 1. Read target container identity
 # ============================================================
 
 NODE="$("${K[@]}" get pod "$TARGET" \
@@ -48,180 +50,162 @@ SA="$("${K[@]}" get pod "$TARGET" \
 STARTED="$("${K[@]}" get pod "$TARGET" \
   -o jsonpath='{.status.containerStatuses[?(@.name=="fluent-bit")].state.running.startedAt}')"
 
-CONTAINER_ID="$("${K[@]}" get pod "$TARGET" \
+CID="$("${K[@]}" get pod "$TARGET" \
   -o jsonpath='{.status.containerStatuses[?(@.name=="fluent-bit")].containerID}')"
 
-if [[ -z "$NODE" || -z "$IMAGE" ||
-      -z "$STARTED" || -z "$CONTAINER_ID" ]]; then
-  echo "ERROR: Target Fluent Bit container is not currently running." >&2
+[[ -n "$NODE" && -n "$IMAGE" &&
+   -n "$STARTED" && -n "$CID" ]] || {
+  echo "ERROR: Fluent Bit is not running" >&2
   exit 1
-fi
+}
 
-if [[ "$IMAGE" != *heap-prof-libunwind* ]]; then
+[[ "$IMAGE" == *5.1.5-heap-prof-libunwind* ]] || {
   echo "ERROR: Unexpected image: $IMAGE" >&2
   exit 1
-fi
+}
+
+[[ "$PROFILE_DIR" == /var/log/fluent-bit-heap-profiles ]] || {
+  echo "ERROR: Unexpected profile directory" >&2
+  exit 1
+}
 
 SA="${SA:-default}"
 START_EPOCH="$(date -u -d "$STARTED" +%s)"
 
-# Prefer the exact image digest when available.
 ANALYSIS_IMAGE="$IMAGE"
 
-if [[ "$IMAGE_ID" =~ ^[^[:space:]]+@sha256:[a-fA-F0-9]{64}$ ]]; then
+IMAGE_ID="${IMAGE_ID#docker-pullable://}"
+IMAGE_ID="${IMAGE_ID#docker://}"
+
+if [[ "$IMAGE_ID" =~ ^[^[:space:]]+@sha256:[[:xdigit:]]{64}$ ]]; then
   ANALYSIS_IMAGE="$IMAGE_ID"
 fi
 
-SHORT="${TARGET#fluent-bit-}"
 STAMP="$(date -u +%m%d%H%M%S)"
+ANALYZER="flb-jeprof-${TARGET#fluent-bit-}-${STAMP}"
 
-ANALYZER="flb-jeprof-${SHORT}-${STAMP}-$$"
-
-MANIFEST="$OUT_DIR/$ANALYZER.yaml"
 REPORT="$OUT_DIR/$ANALYZER.txt"
+MANIFEST="$OUT_DIR/$ANALYZER.yaml"
+
+POD_CREATED=0
+
+exec > >(tee -a "$REPORT") 2>&1
 
 # ============================================================
-# 2. Script Executed Inside the Analyzer Container
+# 2. Cleanup and failure diagnostics
 # ============================================================
 
-ANALYZER_CODE="$(cat <<'IN_ANALYZER'
-set -eu
-umask 077
+on_exit() {
+  local rc=$?
+  trap - EXIT
 
-export HOME=/work
-export TMPDIR=/work
-export TMP=/work
-export TEMP=/work
-export JEPROF_TMPDIR=/work
+  if (( POD_CREATED )); then
+    if (( rc == 0 )); then
+      if [[ "$KEEP_POD" == 1 ]]; then
+        echo "Analyzer preserved: $ANALYZER"
+      else
+        "${K[@]}" delete pod "$ANALYZER" \
+          --wait=false \
+          --ignore-not-found=true || true
+      fi
+    else
+      echo "=== ANALYSIS FAILURE: exit=$rc ==="
 
-BIN=/fluent-bit/bin/fluent-bit
-PREFIX="/profiles/${TARGET_POD}"
+      "${K[@]}" get pod "$ANALYZER" -o wide || true
 
-FILTER='^(prof_backtrace_impl|je_prof_backtrace|je_prof_tctx_create|je_malloc_default|prof_alloc_prep)$'
+      "${K[@]}" get pod "$ANALYZER" \
+        -o jsonpath='{range .status.containerStatuses[*]}{.name}{" reason="}{.state.waiting.reason}{.state.terminated.reason}{" exit="}{.state.terminated.exitCode}{"\n"}{end}' \
+        || true
 
-echo '=== ANALYZER START ==='
-date -u '+UTC %Y-%m-%dT%H:%M:%SZ'
+      "${K[@]}" logs "$ANALYZER" \
+        -c analyzer --tail=80 || true
 
-echo "Pod: $TARGET_POD"
-echo "Target started epoch: $TARGET_START_EPOCH"
-echo "Expected profile prefix: $PREFIX"
-echo "Binary: $BIN"
+      "${K[@]}" describe pod "$ANALYZER" |
+        sed -n '/Events:/,$p' || true
 
-test -r "$BIN" || {
-  echo 'ERROR: Matching Fluent Bit binary not readable'
-  exit 10
-}
-
-command -v jeprof >/dev/null || {
-  echo 'ERROR: jeprof missing'
-  exit 11
-}
-
-test -d /profiles || {
-  echo 'ERROR: HostPath directory not mounted'
-  exit 12
-}
-
-ls -ld /profiles
-
-# ============================================================
-# 3. Find Completed Profiles from Current Process
-# ============================================================
-
-find /profiles \
-  -maxdepth 1 \
-  -type f \
-  -name "${TARGET_POD}.*.i*.heap" \
-  -mmin +1 \
-  -size +0c \
-  -printf '%T@ %p\n' \
-  > /work/all-profiles.txt
-
-awk -v t="$TARGET_START_EPOCH" \
-  '$1 + 0 >= t + 0 {print $2}' \
-  /work/all-profiles.txt |
-  sort -V > /work/current-profiles.txt
-
-COUNT="$(wc -l < /work/current-profiles.txt | tr -d ' ')"
-
-echo "Current-process complete interval profiles: $COUNT"
-
-if [ "$COUNT" -lt 1 ]; then
-  echo 'ERROR: No matching completed .i.heap files.'
-  echo 'Directory sample (names only):'
-  ls -1 /profiles | head -30 || true
-  exit 13
-fi
-
-FIRST="$(head -1 /work/current-profiles.txt)"
-LAST="$(tail -1 /work/current-profiles.txt)"
-
-echo "First: $FIRST"
-echo "Last:  $LAST"
-
-# ============================================================
-# 4. Analyze Latest Heap
-# ============================================================
-
-echo '=== LAST PROFILE: IN-USE BYTES ==='
-
-if timeout 180 jeprof \
-  --text \
-  --show_bytes \
-  --inuse_space \
-  --exclude="$FILTER" \
-  "$BIN" "$LAST" \
-  > /work/latest.txt 2>&1; then
-
-  sed -n '1,70p' /work/latest.txt
-
-else
-  RC=$?
-  sed -n '1,120p' /work/latest.txt
-  echo "ERROR: jeprof latest failed, exit=$RC"
-  exit "$RC"
-fi
-
-# ============================================================
-# 5. Analyze Heap Growth
-# ============================================================
-
-if [ "$COUNT" -ge 2 ] && [ "$FIRST" != "$LAST" ]; then
-
-  echo '=== HEAP DIFF: LAST - FIRST (IN-USE BYTES) ==='
-
-  if timeout 180 jeprof \
-    --text \
-    --show_bytes \
-    --inuse_space \
-    --exclude="$FILTER" \
-    --base="$FIRST" \
-    "$BIN" "$LAST" \
-    > /work/diff.txt 2>&1; then
-
-    sed -n '1,95p' /work/diff.txt
-
-  else
-    RC=$?
-    sed -n '1,120p' /work/diff.txt
-    echo "ERROR: jeprof diff failed, exit=$RC"
-    exit "$RC"
+      echo "Analysis Pod preserved: $ANALYZER"
+    fi
   fi
 
-else
-  echo 'Only one completed profile: cannot calculate Diff.'
-fi
+  echo "Report: $REPORT"
+  exit "$rc"
+}
 
-echo '=== ANALYSIS COMPLETE ==='
+trap on_exit EXIT
 
-IN_ANALYZER
+echo "Target: $TARGET"
+echo "Node: $NODE"
+echo "Image: $ANALYSIS_IMAGE"
+echo "Container ID: $CID"
+echo "Process started: $STARTED"
+echo "Analyzer: $ANALYZER"
+echo "Report UTC: $(date -u +%FT%TZ)"
+
+# ============================================================
+# 3. Discover completed profiles from current process
+# ============================================================
+
+echo "=== DISCOVER CURRENT-PROCESS PROFILES ==="
+
+RAW="$(
+  "${K[@]}" exec "$TARGET" -c fluent-bit -- \
+    find "$PROFILE_DIR" \
+      -maxdepth 1 \
+      -type f \
+      -name "${TARGET}.*.i*.heap" \
+      -mmin +1 \
+      -size +0c \
+      -printf '%T@ %f\n'
 )"
 
+mapfile -t FILES < <(
+  printf '%s\n' "$RAW" |
+    awk -v start="$START_EPOCH" \
+      '$1+0 >= start+0 {print $2}' |
+    sort -V
+)
+
+COUNT="${#FILES[@]}"
+echo "Profiles from current process: $COUNT"
+
+(( COUNT >= 2 )) || {
+  echo "ERROR: At least two completed profiles required"
+  exit 1
+}
+
+for f in "${FILES[@]}"; do
+  [[ "$f" =~ ^${TARGET}\.[0-9]+\.[0-9]+\.i[0-9]+\.heap$ ]] || {
+    echo "ERROR: Unexpected profile filename: $f"
+    exit 1
+  }
+done
+
+FIRST="${FILES[0]}"
+MIDDLE="${FILES[COUNT/2]}"
+LAST="${FILES[COUNT-1]}"
+
+TRANSFER=("$FIRST")
+
+if [[ "$MIDDLE" != "$FIRST" &&
+      "$MIDDLE" != "$LAST" ]]; then
+  TRANSFER+=("$MIDDLE")
+fi
+
+[[ "$LAST" == "$FIRST" ]] || TRANSFER+=("$LAST")
+
+echo "First: $FIRST"
+echo "Middle: $MIDDLE"
+echo "Last: $LAST"
+echo "Selected files: ${#TRANSFER[@]}"
+
 # ============================================================
-# 6. Generate an Isolated Analysis Pod
+# 4. Create a non-privileged Analysis Pod
+#
+# NO hostPath.
+# Only an ephemeral work volume.
 # ============================================================
 
-cat > "$MANIFEST" <<EOF
+cat > "$MANIFEST" <<YAML
 apiVersion: v1
 kind: Pod
 
@@ -231,7 +215,6 @@ metadata:
     app: flb-jeprof-analysis
 
 spec:
-  nodeName: $NODE
   serviceAccountName: $SA
   automountServiceAccountToken: false
   restartPolicy: Never
@@ -242,173 +225,194 @@ spec:
       image: $ANALYSIS_IMAGE
       imagePullPolicy: IfNotPresent
 
-      command: ["/bin/sh", "-eu"]
+      command: ["/bin/sh", "-ec"]
+
       args:
         - |
-$(printf '%s\n' "$ANALYZER_CODE" | sed 's/^/          /')
-
-      env:
-        - name: TARGET_POD
-          value: "$TARGET"
-
-        - name: TARGET_START_EPOCH
-          value: "$START_EPOCH"
+          mkdir -p /work/profiles /work/tmp
+          echo 'Analyzer ready; awaiting profile transfer'
+          sleep 1800
 
       securityContext:
-        allowPrivilegeEscalation: false
+        runAsNonRoot: true
         readOnlyRootFilesystem: true
-        capabilities:
-          drop: ["ALL"]
+        allowPrivilegeEscalation: false
         seccompProfile:
           type: RuntimeDefault
+        capabilities:
+          drop: ["ALL"]
 
       resources:
         requests:
           cpu: 100m
-          memory: 128Mi
-
+          memory: 256Mi
         limits:
           cpu: 500m
           memory: 1Gi
 
       volumeMounts:
-        - name: profiles
-          mountPath: /profiles
-          readOnly: true
-
-        - name: scratch
+        - name: work
           mountPath: /work
 
   volumes:
-    - name: profiles
-      hostPath:
-        path: /var/log/fluent-bit-heap-profiles
-        type: Directory
-
-    - name: scratch
+    - name: work
       emptyDir:
-        sizeLimit: 256Mi
-EOF
+        sizeLimit: 512Mi
+YAML
+
+echo "=== CREATE ANALYZER (NO HOSTPATH) ==="
+
+"${K[@]}" create -f "$MANIFEST"
+
+POD_CREATED=1
+
+echo "=== WAIT FOR ANALYZER READY ==="
+
+"${K[@]}" wait \
+  --for=condition=Ready \
+  "pod/$ANALYZER" \
+  --timeout=300s
+
+# Verify OpenShift-assigned UID and work directory permissions.
+"${K[@]}" exec "$ANALYZER" -c analyzer -- \
+  sh -ec '
+    id
+    test -w /work
+    mkdir -p /work/profiles /work/tmp
+    command -v jeprof >/dev/null
+    command -v tar >/dev/null
+  '
 
 # ============================================================
-# 7. Create the Analyzer Pod
+# 5. Stream selected profiles between Pods
+#
+# Binary data passes through kubectl memory streams.
+# It is not stored on the jump host filesystem.
 # ============================================================
 
-{
-  echo "Report UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  echo "Target: $TARGET"
-  echo "Node: $NODE"
-  echo "Image: $ANALYSIS_IMAGE"
-  echo "Container ID: $CONTAINER_ID"
-  echo "Target started: $STARTED"
-  echo "Analyzer: $ANALYZER"
-  echo "Manifest: $MANIFEST"
-  echo "== CREATE ANALYZER POD =="
-} | tee "$REPORT"
+echo "=== STREAM PROFILE FILES ==="
 
-if ! "${K[@]}" create -f "$MANIFEST" 2>&1 |
-  tee -a "$REPORT"; then
+"${K[@]}" exec "$TARGET" -c fluent-bit -- \
+  tar -C "$PROFILE_DIR" -cf - \
+  -- "${TRANSFER[@]}" |
+"${K[@]}" exec -i "$ANALYZER" -c analyzer -- \
+  tar -C /work/profiles -xf -
 
-  echo "ERROR: Pod creation failed." | tee -a "$REPORT"
-  exit 1
-fi
+echo "=== PROFILE TRANSFER COMPLETE ==="
 
 # ============================================================
-# 8. Wait for Pod Completion
+# 6. Perform Heap Analysis inside isolated Pod
 # ============================================================
 
-PHASE="Pending"
+"${K[@]}" exec -i "$ANALYZER" -c analyzer -- \
+  env \
+    FIRST="$FIRST" \
+    MIDDLE="$MIDDLE" \
+    LAST="$LAST" \
+    HOME=/work \
+    TMPDIR=/work/tmp \
+    JEPROF_TMPDIR=/work/tmp \
+  sh -s <<'IN_ANALYZER'
 
-for ((i=0; i<150; i++)); do
+set -eu
 
-  PHASE="$(
-    "${K[@]}" get pod "$ANALYZER" \
-      -o jsonpath='{.status.phase}' 2>/dev/null || true
-  )"
+BIN=/fluent-bit/bin/fluent-bit
 
-  if [[ "$PHASE" == Succeeded || "$PHASE" == Failed ]]; then
-    break
-  fi
+FILTER='^(prof_backtrace_impl|je_prof_backtrace|je_prof_tctx_create|je_malloc_default|prof_alloc_prep)$'
 
-  sleep 2
+for name in "$FIRST" "$MIDDLE" "$LAST"; do
+  test -s "/work/profiles/$name" || {
+    echo "ERROR: Missing profile: $name"
+    exit 31
+  }
 done
 
-echo "== POD PHASE: ${PHASE:-unknown} ==" | tee -a "$REPORT"
+mkdir -p /work/tmp
 
-# ============================================================
-# 9. Collect Actual Logs and Exit Code
-# ============================================================
+run_jeprof() {
+  label="$1"
+  base="$2"
+  latest="$3"
+  output="$4"
 
-echo "== ANALYZER LOGS ==" | tee -a "$REPORT"
+  echo "=== $label ==="
 
-"${K[@]}" logs "$ANALYZER" \
-  -c analyzer --timestamps 2>&1 |
-  tee -a "$REPORT" || true
+  if [ -z "$base" ]; then
 
-EXIT_CODE="$(
-  "${K[@]}" get pod "$ANALYZER" \
-    -o jsonpath='{.status.containerStatuses[?(@.name=="analyzer")].state.terminated.exitCode}' \
-    2>/dev/null || true
-)"
+    if timeout 180 jeprof \
+      --text \
+      --show_bytes \
+      --inuse_space \
+      --exclude="$FILTER" \
+      "$BIN" \
+      "/work/profiles/$latest" \
+      > "$output" 2>&1; then
 
-FINAL_STARTED="$(
-  "${K[@]}" get pod "$TARGET" \
-    -o jsonpath='{.status.containerStatuses[?(@.name=="fluent-bit")].state.running.startedAt}' \
-    2>/dev/null || true
-)"
+      sed -n '1,85p' "$output"
 
-echo "Analyzer phase=$PHASE exitCode=${EXIT_CODE:-unknown}" |
-  tee -a "$REPORT"
+    else
+      rc=$?
+      sed -n '1,100p' "$output"
+      exit "$rc"
+    fi
 
-# ============================================================
-# 10. Failure Handling
-# ============================================================
+  else
 
-if [[ "$PHASE" != Succeeded ||
-      "$EXIT_CODE" != 0 ||
-      "$FINAL_STARTED" != "$STARTED" ]]; then
+    if timeout 180 jeprof \
+      --text \
+      --show_bytes \
+      --inuse_space \
+      --exclude="$FILTER" \
+      --base="/work/profiles/$base" \
+      "$BIN" \
+      "/work/profiles/$latest" \
+      > "$output" 2>&1; then
 
-  echo '== POD EVENTS / STATE ==' | tee -a "$REPORT"
+      sed -n '1,100p' "$output"
 
-  "${K[@]}" get pod "$ANALYZER" \
-    -o jsonpath='{range .status.containerStatuses[*]}{.name}{" state="}{.state.terminated.reason}{" exit="}{.state.terminated.exitCode}{" waiting="}{.state.waiting.reason}{" message="}{.state.waiting.message}{"\n"}{end}' \
-    2>&1 | tee -a "$REPORT" || true
-
-  "${K[@]}" describe pod "$ANALYZER" 2>&1 |
-    sed -n '/Events:/,$p' |
-    tee -a "$REPORT" || true
-
-  if [[ "$FINAL_STARTED" != "$STARTED" ]]; then
-    echo 'ERROR: Fluent Bit restarted during analysis; comparison is not trustworthy.' |
-      tee -a "$REPORT"
+    else
+      rc=$?
+      sed -n '1,100p' "$output"
+      exit "$rc"
+    fi
   fi
+}
 
-  echo "FAILED or incomplete; analyzer preserved: $ANALYZER" |
-    tee -a "$REPORT"
+run_jeprof \
+  'LATEST IN-USE HEAP' \
+  '' "$LAST" /work/latest.txt
 
-  echo "Saved report: $REPORT"
+run_jeprof \
+  'GROWTH: FIRST -> LAST' \
+  "$FIRST" "$LAST" /work/diff-first-last.txt
+
+if [ "$MIDDLE" != "$FIRST" ] &&
+   [ "$MIDDLE" != "$LAST" ]; then
+
+  run_jeprof \
+    'GROWTH: MIDDLE -> LAST' \
+    "$MIDDLE" "$LAST" /work/diff-middle-last.txt
+fi
+
+echo "=== ANALYSIS COMPLETE ==="
+
+IN_ANALYZER
+
+# ============================================================
+# 7. Confirm source container did not restart
+# ============================================================
+
+NEW_CID="$(
+  "${K[@]}" get pod "$TARGET" \
+    -o jsonpath='{.status.containerStatuses[?(@.name=="fluent-bit")].containerID}'
+)"
+
+[[ "$NEW_CID" == "$CID" ]] || {
+  echo "ERROR: Source Fluent Bit restarted during analysis"
   exit 1
-fi
+}
 
-# ============================================================
-# 11. Success and Cleanup
-# ============================================================
-
-echo 'ANALYSIS SUCCEEDED' | tee -a "$REPORT"
-
-if [[ "$KEEP_POD" == 1 ]]; then
-
-  echo "Analyzer preserved (KEEP_POD=1): $ANALYZER" |
-    tee -a "$REPORT"
-
-else
-
-  "${K[@]}" delete pod "$ANALYZER" --wait=false 2>&1 |
-    tee -a "$REPORT" || true
-
-fi
-
-echo "Saved report: $REPORT"
+echo "ANALYSIS SUCCEEDED"
 
 SCRIPT
 
