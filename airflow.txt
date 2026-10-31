@@ -1,0 +1,15 @@
+kubectl get pods -A \
+  --field-selector=status.phase=Running \
+  -o custom-columns=NODE:.spec.nodeName,NAMESPACE:.metadata.namespace,NAME:.metadata.name \
+  --no-headers |
+awk '
+{
+  total[$1]++
+  if ($2 ~ /airflow/i || $3 ~ /airflow/i)
+    airflow[$1]++
+}
+END {
+  printf "%-45s %12s %12s\n", "NODE", "RUNNING PODS", "AIRFLOW PODS"
+  for (node in total)
+    printf "%-45s %12d %12d\n", node, total[node], airflow[node]
+}'
