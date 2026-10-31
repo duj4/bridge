@@ -1,0 +1,44 @@
+for pod in fluent-bit-b9mkl fluent-bit-fxn8n fluent-bit-qfxfs; do
+  echo "========== $pod =========="
+
+  kubectl exec -i "$pod" -c fluent-bit -- sh -s <<'IN_POD'
+CG="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/1/cgroup)"
+
+for i in 1 2 3; do
+  BEFORE=$(cat "$CG/memory.current")
+  STAT=$(cat "$CG/memory.stat")
+  AFTER=$(cat "$CG/memory.current")
+
+  printf '%s\n' "$STAT" |
+  awk -v before="$BEFORE" -v after="$AFTER" '
+    $1=="anon"    {anon=$2}
+    $1=="file"    {file=$2}
+    $1=="kernel"  {kernel=$2}
+    $1=="sock"    {sock=$2}
+    $1=="zswap"   {zswap=$2}
+    $1=="hugetlb" {hugetlb=$2}
+
+    END {
+      unit=1048576
+      accounted=anon+file+kernel
+
+      printf "Current before/after: %.2f / %.2f MiB\n", before/unit, after/unit
+      printf "Anon:                 %.2f MiB\n", anon/unit
+      printf "File:                 %.2f MiB\n", file/unit
+      printf "Kernel:               %.2f MiB\n", kernel/unit
+      printf "Sock / zswap / hugetlb: %.2f / %.2f / %.2f MiB\n",
+        sock/unit,zswap/unit,hugetlb/unit
+      printf "Accounting residual:  %.2f MiB\n\n",
+        (after-accounted)/unit
+    }
+  '
+  sleep 1
+done
+
+echo "=== LOCAL MEMORY EVENTS ==="
+if [ -r "$CG/memory.events.local" ]; then
+  cat "$CG/memory.events.local"
+fi
+IN_POD
+
+done
