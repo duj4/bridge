@@ -1,0 +1,20 @@
+for pod in fluent-bit-b9mkl fluent-bit-fxn8n fluent-bit-qfxfs; do
+  echo "========== $pod =========="
+
+  kubectl exec "$pod" -c fluent-bit -- sh -c '
+    echo "Kernel: $(uname -r)"
+    echo "Online CPUs: $(cat /sys/devices/system/cpu/online)"
+
+    CPUS=$(grep -c "^processor" /proc/cpuinfo)
+    PAGE=$(getconf PAGESIZE 2>/dev/null || echo 4096)
+
+    echo "Logical CPUs: $CPUS"
+    echo "Page size: $PAGE"
+
+    awk -v n="$CPUS" -v p="$PAGE" \
+    "BEGIN {
+      printf \"32-page batch tolerance: %.1f MiB\n\", n*32*p/1048576
+      printf \"64-page batch tolerance: %.1f MiB\n\", n*64*p/1048576
+    }"
+  '
+done
