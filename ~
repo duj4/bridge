@@ -1,0 +1,96 @@
+# 先备份
+cp -p flb-jeprof-isolated.sh \
+  "flb-jeprof-isolated.sh.bak.$(date +%Y%m%d%H%M%S)"
+
+python3 - <<'PY'
+from pathlib import Path
+import subprocess
+
+p = Path("flb-jeprof-isolated.sh")
+s = p.read_text()
+
+head = """  awk -v f="$file" -v utc="$utc" '
+"""
+tail = "' /work/current.collapsed"
+
+if s.count(head) != 1:
+    raise SystemExit("ERROR: Cannot identify AWK block uniquely")
+
+start = s.index(head)
+end = s.find(tail, start)
+
+if end == -1:
+    raise SystemExit("ERROR: AWK block end not found")
+
+end += len(tail)
+
+program = r'''
+    NF >= 2 && $NF ~ /^[0-9]+$/ {
+      v = $NF + 0
+      total += v
+
+      if (index($0,"cb_loki_flush") || index($0,"send_loki_payload") || index($0,"loki_compose_payload")) {
+        loki += v
+        next
+      }
+
+      if (index($0,"flb_tail_") || index($0,"in_tail_") || index($0,"tail_fs_event")) {
+        tail += v
+        next
+      }
+
+      if (index($0,"cb_metrics_prometheus") || index($0,"unpack_metric_array_entry") || index($0,"cmt_") || index($0,"flb_hs_push")) {
+        metrics += v
+        next
+      }
+
+      if (index($0,"cio_memfs_open") || index($0,"flb_input_chunk_create")) {
+        chunk += v
+        next
+      }
+
+      other += v
+    }
+
+    END {
+      unit = 1048576
+      printf "%s\t%s\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\n",
+        f, utc, total/unit, loki/unit, tail/unit, metrics/unit, chunk/unit, other/unit
+    }
+'''
+
+# 使用模拟调用栈验证分类正确性
+sample = """a;cb_loki_flush;CRYPTO_malloc 1048576
+a;flb_tail_file_append;msgpack_sbuffer_write 524288
+a;cb_metrics_prometheus;cmt_encode 262144
+a;cio_memfs_open 131072
+a;sqlite3MemMalloc 131072
+"""
+
+result = subprocess.run(
+    ["awk", "-v", "f=test", "-v", "utc=now", program],
+    input=sample,
+    text=True,
+    capture_output=True
+)
+
+if result.returncode != 0:
+    raise SystemExit("AWK validation failed: " + result.stderr)
+
+expected = [
+    "test", "now", "2.00", "1.00",
+    "0.50", "0.25", "0.12", "0.12"
+]
+
+if result.stdout.strip().split("\t") != expected:
+    raise SystemExit("AWK classification result incorrect")
+
+replacement = head + program + "  " + tail
+
+p.write_text(s[:start] + replacement + s[end:])
+
+print("AWK CLASSIFIER TEST PASSED")
+print("SCRIPT UPDATED")
+PY
+
+bash -n flb-jeprof-isolated.sh && echo "BASH SYNTAX PASSED"
