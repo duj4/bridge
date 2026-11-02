@@ -1,4 +1,4 @@
-# 先备份
+# 先备份原脚本
 cp -p flb-jeprof-isolated.sh \
   "flb-jeprof-isolated.sh.bak.$(date +%Y%m%d%H%M%S)"
 
@@ -8,89 +8,121 @@ import subprocess
 
 p = Path("flb-jeprof-isolated.sh")
 s = p.read_text()
+version = "FLB_JEPROF_AWK_V6_20261102"
 
-head = """  awk -v f="$file" -v utc="$utc" '
+if version in s:
+    raise SystemExit("Already patched: " + str(p.resolve()))
+
+start = """  awk -v f="$file" -v utc="$utc" '
 """
-tail = "' /work/current.collapsed"
+end = "' /work/current.collapsed"
+marker = "while IFS= read -r file; do"
 
-if s.count(head) != 1:
-    raise SystemExit("ERROR: Cannot identify AWK block uniquely")
+assert s.count(start) == 1, "AWK start not found uniquely"
+assert s.count(end) == 1, "AWK end not found uniquely"
+assert s.count(marker) == 1, "Loop not found uniquely"
 
-start = s.index(head)
-end = s.find(tail, start)
+awk = r'''
+NF >= 2 && $NF ~ /^[0-9]+$/ {
+  v = $NF + 0
+  total += v
 
-if end == -1:
-    raise SystemExit("ERROR: AWK block end not found")
+  if (index($0,"cb_loki_flush") || index($0,"send_loki_payload") || index($0,"loki_compose_payload")) { loki += v; next }
+  if (index($0,"flb_tail_") || index($0,"in_tail_") || index($0,"tail_fs_event")) { tail += v; next }
+  if (index($0,"cb_metrics_prometheus") || index($0,"unpack_metric_array_entry") || index($0,"cmt_") || index($0,"flb_hs_push")) { metrics += v; next }
+  if (index($0,"cio_memfs_open") || index($0,"flb_input_chunk_create")) { chunk += v; next }
 
-end += len(tail)
+  other += v
+}
 
-program = r'''
-    NF >= 2 && $NF ~ /^[0-9]+$/ {
-      v = $NF + 0
-      total += v
-
-      if (index($0,"cb_loki_flush") || index($0,"send_loki_payload") || index($0,"loki_compose_payload")) {
-        loki += v
-        next
-      }
-
-      if (index($0,"flb_tail_") || index($0,"in_tail_") || index($0,"tail_fs_event")) {
-        tail += v
-        next
-      }
-
-      if (index($0,"cb_metrics_prometheus") || index($0,"unpack_metric_array_entry") || index($0,"cmt_") || index($0,"flb_hs_push")) {
-        metrics += v
-        next
-      }
-
-      if (index($0,"cio_memfs_open") || index($0,"flb_input_chunk_create")) {
-        chunk += v
-        next
-      }
-
-      other += v
-    }
-
-    END {
-      unit = 1048576
-      printf "%s\t%s\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\n",
-        f, utc, total/unit, loki/unit, tail/unit, metrics/unit, chunk/unit, other/unit
-    }
+END {
+  u = 1048576
+  printf "%s\t%s\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\n",
+    f, utc, total/u, loki/u, tail/u, metrics/u, chunk/u, other/u
+}
 '''
 
-# 使用模拟调用栈验证分类正确性
-sample = """a;cb_loki_flush;CRYPTO_malloc 1048576
-a;flb_tail_file_append;msgpack_sbuffer_write 524288
-a;cb_metrics_prometheus;cmt_encode 262144
-a;cio_memfs_open 131072
-a;sqlite3MemMalloc 131072
-"""
+sample = "\n".join([
+    "x;cb_loki_flush 1048576",
+    "x;flb_tail_file_append 2097152",
+    "x;cb_metrics_prometheus 3145728",
+    "x;cio_memfs_open 4194304",
+    "x;other 5242880",
+    ""
+])
 
 result = subprocess.run(
-    ["awk", "-v", "f=test", "-v", "utc=now", program],
+    ["awk", "-v", "f=SELFTEST", "-v", "utc=NOW", awk],
     input=sample,
+    capture_output=True,
+    text=True
+)
+
+expected = "SELFTEST\tNOW\t15.00\t1.00\t2.00\t3.00\t4.00\t5.00"
+
+assert result.returncode == 0, result.stderr
+assert result.stdout.strip() == expected, result.stdout
+
+# Write the actual classifier once, and reuse it.
+prep = """echo '=== AWK CLASSIFIER V6 ==='
+cat > /work/classifier.awk <<'END_CLASSIFIER_AWK'
+""" + awk + """END_CLASSIFIER_AWK
+
+if ! printf '%s\\n' \\
+  'x;cb_loki_flush 1048576' \\
+  'x;flb_tail_file_append 2097152' \\
+  'x;cb_metrics_prometheus 3145728' \\
+  'x;cio_memfs_open 4194304' \\
+  'x;other 5242880' | \\
+  awk -v f=SELFTEST -v utc=NOW -f /work/classifier.awk \\
+  > /work/classifier-test.txt 2> /work/classifier-error.txt; then
+  echo 'AWK SELFTEST FAILED'
+  cat /work/classifier-error.txt
+  exit 39
+fi
+
+expected="$(printf 'SELFTEST\\tNOW\\t15.00\\t1.00\\t2.00\\t3.00\\t4.00\\t5.00')"
+
+[ "$(cat /work/classifier-test.txt)" = "$expected" ] || {
+  echo 'AWK SELFTEST INCORRECT OUTPUT'
+  cat /work/classifier-test.txt
+  exit 40
+}
+
+echo 'AWK CLASSIFIER SELFTEST PASSED'
+
+"""
+
+a = s.index(start)
+b = s.index(end, a) + len(end)
+
+s = (
+    s[:a]
+    + '  awk -v f="$file" -v utc="$utc" -f /work/classifier.awk /work/current.collapsed'
+    + s[b:]
+)
+
+s = s.replace(marker, prep + marker, 1)
+s = s.replace(
+    "set -Eeuo pipefail",
+    'set -Eeuo pipefail\necho "' + version + '"',
+    1
+)
+
+check = subprocess.run(
+    ["bash", "-n"],
+    input=s,
     text=True,
     capture_output=True
 )
 
-if result.returncode != 0:
-    raise SystemExit("AWK validation failed: " + result.stderr)
+assert check.returncode == 0, check.stderr
 
-expected = [
-    "test", "now", "2.00", "1.00",
-    "0.50", "0.25", "0.12", "0.12"
-]
+p.write_text(s)
 
-if result.stdout.strip().split("\t") != expected:
-    raise SystemExit("AWK classification result incorrect")
-
-replacement = head + program + "  " + tail
-
-p.write_text(s[:start] + replacement + s[end:])
-
-print("AWK CLASSIFIER TEST PASSED")
-print("SCRIPT UPDATED")
+print("HOST AWK SELFTEST PASSED")
+print("PATCHED:", p.resolve())
+print("VERSION:", version)
 PY
 
-bash -n flb-jeprof-isolated.sh && echo "BASH SYNTAX PASSED"
+bash -n ./flb-jeprof-isolated.sh
