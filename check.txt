@@ -1,17 +1,15 @@
-for pod in fluent-bit-b9mkl fluent-bit-fxn8n fluent-bit-qfxfs; do
-  echo "========== $pod =========="
+kubectl exec fluent-bit-b9mkl -c fluent-bit -- sh -c '
+for pat in \
+  "*_airflow3_airflow*.log" \
+  "*_airflow3qa_airflow*.log"
+do
+  echo "===== $pat ====="
 
-  kubectl logs "$pod" -c fluent-bit --since=24h |
-    awk '
-      /created new multiline stream for/ {
-        if ($0 ~ /kube\.Airflow3qa\./)
-          qa++
-        else if ($0 ~ /kube\.Airflow3\./)
-          airflow++
-      }
-      END {
-        printf "Airflow3 streams created:    %d\n", airflow
-        printf "Airflow3qa streams created:  %d\n", qa
-      }
-    '
+  find /var/log/containers -maxdepth 1 \
+    -name "$pat" -print 2>/dev/null | head -5
+
+  printf "Matched files: "
+  find /var/log/containers -maxdepth 1 \
+    -name "$pat" -print 2>/dev/null | wc -l
 done
+'
