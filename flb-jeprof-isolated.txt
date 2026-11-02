@@ -1,128 +1,189 @@
-# 先备份原脚本
 cp -p flb-jeprof-isolated.sh \
   "flb-jeprof-isolated.sh.bak.$(date +%Y%m%d%H%M%S)"
 
-python3 - <<'PY'
+cat > /tmp/flb-jeprof-v7-patch.py <<'PY'
 from pathlib import Path
+import os
+import shutil
 import subprocess
+import sys
 
 p = Path("flb-jeprof-isolated.sh")
 s = p.read_text()
-version = "FLB_JEPROF_AWK_V6_20261102"
 
-if version in s:
-    raise SystemExit("Already patched: " + str(p.resolve()))
+old = 'echo "FLB_JEPROF_AWK_V6_20261102"'
+new = 'echo "FLB_JEPROF_V7_PERL_FULLSTACK_20261102"'
+marker = "echo 'AWK CLASSIFIER SELFTEST PASSED'\n"
+begin = "show_delta() {"
+end = "show_delta 'FIRST -> MIDDLE'"
 
-start = """  awk -v f="$file" -v utc="$utc" '
-"""
-end = "' /work/current.collapsed"
-marker = "while IFS= read -r file; do"
+if new in s:
+    sys.exit("Already V7")
 
-assert s.count(start) == 1, "AWK start not found uniquely"
-assert s.count(end) == 1, "AWK end not found uniquely"
-assert s.count(marker) == 1, "Loop not found uniquely"
+if any(s.count(x) != 1 for x in (old, marker, begin, end)):
+    sys.exit("ERROR: Unexpected V6 script structure")
 
-awk = r'''
-NF >= 2 && $NF ~ /^[0-9]+$/ {
-  v = $NF + 0
-  total += v
+setup = r'''
+cat > /work/stack-top.pl <<'PERL_V7'
+use strict;
+use warnings;
 
-  if (index($0,"cb_loki_flush") || index($0,"send_loki_payload") || index($0,"loki_compose_payload")) { loki += v; next }
-  if (index($0,"flb_tail_") || index($0,"in_tail_") || index($0,"tail_fs_event")) { tail += v; next }
-  if (index($0,"cb_metrics_prometheus") || index($0,"unpack_metric_array_entry") || index($0,"cmt_") || index($0,"flb_hs_push")) { metrics += v; next }
-  if (index($0,"cio_memfs_open") || index($0,"flb_input_chunk_create")) { chunk += v; next }
+my ($file, $mode, $limit) = @ARGV;
 
-  other += v
+die "Invalid mode\n"
+    unless $mode eq "POSITIVE" || $mode eq "NEGATIVE";
+
+open(my $fh, "<", $file)
+    or die "Cannot open $file: $!\n";
+
+my @rows;
+my $nonempty = 0;
+my $parsed = 0;
+
+while (my $line = <$fh>) {
+    next if $line =~ /^\s*$/;
+    $nonempty++;
+
+    next unless $line =~ /^\s*(.*?)\s+([+-]?\d+)\s*$/;
+
+    my ($stack, $bytes) = ($1, 0 + $2);
+    $parsed++;
+
+    next if $bytes == 0;
+    next if $mode eq "POSITIVE" && $bytes < 0;
+    next if $mode eq "NEGATIVE" && $bytes > 0;
+
+    my @frames = split(/;/, $stack);
+    my @selected;
+
+    for my $frame (@frames) {
+        $frame =~ s/<[^<>]*>$//;
+
+        if ($frame =~ /flb_|in_tail|tail_fs_event|cb_|send_loki|cio_|msgpack|CRYPTO_|SSL_|cmt_|unpack_|encoder_|rallocx|sds_|_create/) {
+            push @selected, $frame;
+        }
+    }
+
+    my $path = @selected
+        ? join(" > ", @selected)
+        : $stack;
+
+    push @rows, [$bytes, substr($path, 0, 650)];
 }
 
-END {
-  u = 1048576
-  printf "%s\t%s\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\n",
-    f, utc, total/u, loki/u, tail/u, metrics/u, chunk/u, other/u
+close $fh;
+
+die "Unrecognized collapsed profile format\n"
+    if $nonempty > 0 && $parsed == 0;
+
+@rows = sort {
+    $mode eq "POSITIVE"
+        ? $b->[0] <=> $a->[0]
+        : $a->[0] <=> $b->[0]
+} @rows;
+
+if (!@rows) {
+    print "NO_MATCHING_STACKS ($mode)\n";
+    exit 0;
 }
-'''
 
-sample = "\n".join([
-    "x;cb_loki_flush 1048576",
-    "x;flb_tail_file_append 2097152",
-    "x;cb_metrics_prometheus 3145728",
-    "x;cio_memfs_open 4194304",
-    "x;other 5242880",
-    ""
-])
+for (my $i = 0; $i < @rows && $i < $limit; $i++) {
+    printf "%.0f\t%s\n",
+        $rows[$i]->[0],
+        $rows[$i]->[1];
+}
+PERL_V7
 
-result = subprocess.run(
-    ["awk", "-v", "f=SELFTEST", "-v", "utc=NOW", awk],
-    input=sample,
-    capture_output=True,
-    text=True
-)
-
-expected = "SELFTEST\tNOW\t15.00\t1.00\t2.00\t3.00\t4.00\t5.00"
-
-assert result.returncode == 0, result.stderr
-assert result.stdout.strip() == expected, result.stdout
-
-# Write the actual classifier once, and reuse it.
-prep = """echo '=== AWK CLASSIFIER V6 ==='
-cat > /work/classifier.awk <<'END_CLASSIFIER_AWK'
-""" + awk + """END_CLASSIFIER_AWK
-
-if ! printf '%s\\n' \\
-  'x;cb_loki_flush 1048576' \\
-  'x;flb_tail_file_append 2097152' \\
-  'x;cb_metrics_prometheus 3145728' \\
-  'x;cio_memfs_open 4194304' \\
-  'x;other 5242880' | \\
-  awk -v f=SELFTEST -v utc=NOW -f /work/classifier.awk \\
-  > /work/classifier-test.txt 2> /work/classifier-error.txt; then
-  echo 'AWK SELFTEST FAILED'
-  cat /work/classifier-error.txt
-  exit 39
+# Validate with the actual Perl runtime inside Analysis Pod.
+if ! perl -c /work/stack-top.pl >/work/perl-check.log 2>&1; then
+    cat /work/perl-check.log
+    exit 43
 fi
 
-expected="$(printf 'SELFTEST\\tNOW\\t15.00\\t1.00\\t2.00\\t3.00\\t4.00\\t5.00')"
+printf '%s\n' \
+  'a;flb_tail_file_append<0x1> 1048576' \
+  'a;cb_loki_flush<0x2>;CRYPTO_malloc -524288' \
+  > /work/stack-test.txt
 
-[ "$(cat /work/classifier-test.txt)" = "$expected" ] || {
-  echo 'AWK SELFTEST INCORRECT OUTPUT'
-  cat /work/classifier-test.txt
-  exit 40
+positive="$(perl /work/stack-top.pl /work/stack-test.txt POSITIVE 2)" || exit 44
+negative="$(perl /work/stack-top.pl /work/stack-test.txt NEGATIVE 2)" || exit 45
+
+expected_positive="$(printf '1048576\tflb_tail_file_append')"
+expected_negative="$(printf '%s\t%s' -524288 'cb_loki_flush > CRYPTO_malloc')"
+
+if [ "$positive" != "$expected_positive" ] ||
+   [ "$negative" != "$expected_negative" ]; then
+    echo "ERROR: V7 formatter self-test failed"
+    exit 46
+fi
+
+echo "FULL STACK FORMATTER V7 SELFTEST PASSED"
+
+'''
+
+replacement = r'''show_delta() {
+  label="$1"
+  base="$2"
+  current="$3"
+
+  echo
+  echo "=== HEAP GROWTH: $label ==="
+
+  if ! timeout 180 jeprof \
+      --collapsed \
+      --show_bytes \
+      --inuse_space \
+      --exclude="$FILTER" \
+      --base="$base" \
+      "$BIN" "$current" \
+      > /work/delta.collapsed \
+      2> /work/jeprof.err; then
+
+    cat /work/jeprof.err
+    exit 23
+  fi
+
+  awk '$NF ~ /^-?[0-9]+$/ {s+=$NF}
+       END {
+         printf "Sampled in-use net difference: %+.2f MiB\n",
+                s/1048576
+       }' /work/delta.collapsed
+
+  echo "--- TOP POSITIVE FULL PATHS ---"
+  perl /work/stack-top.pl /work/delta.collapsed POSITIVE 12
+
+  echo "--- TOP NEGATIVE FULL PATHS ---"
+  perl /work/stack-top.pl /work/delta.collapsed NEGATIVE 8
 }
 
-echo 'AWK CLASSIFIER SELFTEST PASSED'
+'''
 
-"""
+s = s.replace(old, new, 1)
+s = s.replace(marker, marker + "\n" + setup, 1)
 
-a = s.index(start)
-b = s.index(end, a) + len(end)
+a = s.index(begin)
+b = s.index(end, a)
+s = s[:a] + replacement + s[b:]
 
-s = (
-    s[:a]
-    + '  awk -v f="$file" -v utc="$utc" -f /work/classifier.awk /work/current.collapsed'
-    + s[b:]
-)
-
-s = s.replace(marker, prep + marker, 1)
-s = s.replace(
-    "set -Eeuo pipefail",
-    'set -Eeuo pipefail\necho "' + version + '"',
-    1
-)
+tmp = p.with_name(p.name + ".v7.tmp")
+tmp.write_text(s)
+shutil.copymode(str(p), str(tmp))
 
 check = subprocess.run(
-    ["bash", "-n"],
-    input=s,
-    text=True,
-    capture_output=True
+    ["bash", "-n", str(tmp)],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    universal_newlines=True
 )
 
-assert check.returncode == 0, check.stderr
+if check.returncode != 0:
+    tmp.unlink()
+    sys.exit(check.stderr)
 
-p.write_text(s)
+os.replace(str(tmp), str(p))
 
-print("HOST AWK SELFTEST PASSED")
-print("PATCHED:", p.resolve())
-print("VERSION:", version)
+print("V7 PATCH APPLIED")
+print("BASH SYNTAX PASSED")
 PY
 
-bash -n ./flb-jeprof-isolated.sh
+python3 /tmp/flb-jeprof-v7-patch.py
