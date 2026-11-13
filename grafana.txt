@@ -100,3 +100,34 @@ jq '
       has_expr: ((.value.model.expr // "") | length > 0)
     }
 ' bjv-grafana-eut-alerts.json
+
+jq '
+  ([
+    .[] | .data[]?
+    | select(.model.datasource.type == "prometheus")
+    | .datasourceUid
+    | select(type == "string" and length > 0)
+  ] | unique) as $prom_uids
+
+  | to_entries[] as $rule
+  | ($rule.value.data // [])[] as $t
+
+  | select(
+      .datasourceUid != "__expr__"
+      and .datasourceUid != "-100"
+      and .model.datasource.type != "__expr__"
+      and .model.datasource.type != "prometheus"
+    )
+
+  | ($t.datasourceUid // $t.model.datasource.uid // "") as $uid
+
+  | {
+      alert_index: $rule.key,
+      refId: $t.refId,
+      datasource_uid_present: ($uid != ""),
+      known_prometheus_uid: (
+        $uid != "" and ($prom_uids | index($uid)) != null
+      ),
+      has_expr: (($t.model.expr // "") | length > 0)
+    }
+' bjv-grafana-eut-alerts.json
