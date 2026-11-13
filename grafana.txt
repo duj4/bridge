@@ -36,3 +36,18 @@ jq -r '
   | select(($errors | length) > 0)
   | "\(.title) | \($errors | length) query errors"
 ' bjv-grafana-eut-metrics-in-dashboards.json
+
+jq -r '
+  .dashboards[] as $d
+  | ($d.parse_errors // [])[]
+  | select(startswith("query="))
+  | ([scan("windows_[A-Za-z0-9_:]+")] | unique)[] as $m
+  | select((($d.metrics // []) | index($m)) == null)
+  | "\($d.title)\t\($m)"
+' bjv-grafana-eut-metrics-in-dashboards.json | sort -u
+
+jq -r '
+  .dashboards[]
+  | select((.metrics // [] | length) == 0)
+  | "\(.title) | errors: \((.parse_errors // []) | length)"
+' bjv-grafana-eut-metrics-in-dashboards.json
