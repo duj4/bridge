@@ -56,3 +56,29 @@ jq '{
   alert_rules: length,
   query_targets: ([.[] | .data[]?] | length)
 }' grafana-alert-rules.json
+
+jq '
+  def is_expression:
+    .datasourceUid == "__expr__"
+    or .datasourceUid == "-100"
+    or .model.datasource.type == "__expr__";
+
+  def is_prometheus:
+    .model.datasource.type == "prometheus";
+
+  [.[] | .data[]?] as $targets |
+  {
+    all_targets: ($targets | length),
+    prometheus_targets: (
+      [$targets[] | select(is_prometheus)] | length
+    ),
+    grafana_expression_targets: (
+      [$targets[] | select(is_expression)] | length
+    ),
+    other_or_unknown: (
+      [$targets[] |
+        select((is_prometheus or is_expression) | not)
+      ] | length
+    )
+  }
+' bjv-grafana-eut-alerts.json
