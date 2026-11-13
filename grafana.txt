@@ -17,4 +17,22 @@ jq '{
   )
 }' mimirtool.json
 
+jq -r '
+  [.dashboards[].parse_errors[]? |
+    if startswith("unsupported panel type:") then .
+    elif startswith("query=") then "PromQL query parse error"
+    else "Other error"
+    end
+  ]
+  | group_by(.)
+  | map({type: .[0], count: length})
+  | sort_by(-.count)[]
+  | "\(.count)\t\(.type)"
+' bjv-grafana-eut-metrics-in-dashboards.json
 
+jq -r '
+  .dashboards[]
+  | [.parse_errors[]? | select(startswith("query="))] as $errors
+  | select(($errors | length) > 0)
+  | "\(.title) | \($errors | length) query errors"
+' bjv-grafana-eut-metrics-in-dashboards.json
