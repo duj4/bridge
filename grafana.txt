@@ -51,3 +51,8 @@ jq -r '
   | select((.metrics // [] | length) == 0)
   | "\(.title) | errors: \((.parse_errors // []) | length)"
 ' bjv-grafana-eut-metrics-in-dashboards.json
+
+jq '{
+  alert_rules: length,
+  query_targets: ([.[] | .data[]?] | length)
+}' grafana-alert-rules.json
