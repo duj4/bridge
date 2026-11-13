@@ -82,3 +82,21 @@ jq '
     )
   }
 ' bjv-grafana-eut-alerts.json
+
+jq '
+  to_entries[] as $rule
+  | ($rule.value.data // [] | to_entries[])
+  | select(
+      .value.datasourceUid != "__expr__"
+      and .value.datasourceUid != "-100"
+      and .value.model.datasource.type != "__expr__"
+      and .value.model.datasource.type != "prometheus"
+    )
+  | {
+      alert_index: $rule.key,
+      refId: .value.refId,
+      datasource_type: .value.model.datasource.type,
+      model_type: .value.model.type,
+      has_expr: ((.value.model.expr // "") | length > 0)
+    }
+' bjv-grafana-eut-alerts.json
