@@ -1,58 +1,20 @@
-(
-  set -euo pipefail
+jq '.dashboards | length' mimirtool.json
 
-  FIRST="dashboards-in-bjv-grafana-eut-13.json"
-  GRAFANA_URL="https://<grafana_host>"
-  NAMESPACE="org-13"
-
-  DIR=$(mktemp -d "$PWD/dashboard-pages.XXXXXX")
-  cp "$FIRST" "$DIR/page-001.json"
-
-  read -rsp "Grafana Token: " TOKEN
-  echo
-
-  page=1
-
-  while true; do
-    current=$(printf '%s/page-%03d.json' "$DIR" "$page")
-    cursor=$(jq -r '.metadata.continue // empty' "$current")
-
-    [[ -z "$cursor" ]] && break
-
-    page=$((page + 1))
-    next=$(printf '%s/page-%03d.json' "$DIR" "$page")
-
-    curl -fsS -G \
-      -H "Authorization: Bearer ${TOKEN}" \
-      --data-urlencode "continue=${cursor}" \
-      "${GRAFANA_URL}/apis/dashboard.grafana.app/v1/namespaces/${NAMESPACE}/dashboards" \
-      -o "$next"
-
-    jq -e '.kind == "DashboardList" and (.items | type == "array")' \
-      "$next" > /dev/null
-
-    echo "Page $page: $(jq '.items | length' "$next") dashboards"
-  done
-
-  jq -s '
-    . as $pages
-    | $pages[0]
-    | .metadata = ((.metadata // {}) | del(.continue))
-    | .items = [$pages[].items[]]
-  ' "$DIR"/page-*.json > dashboards-all.json
-
-  echo "Total pages: $page"
-  echo "Total dashboards: $(jq '.items | length' dashboards-all.json)"
-)
-
+jq -r '
+  .dashboards[] |
+  "\(.title) | \(.metrics | length) metrics"
+' mimirtool.json
 
 jq '{
-  kind,
-  dashboards: (.items | length),
-  has_next_page: ((.metadata.continue // "") != "")
-}' dashboards-all.json
+  dashboards: (.dashboards | length),
+  unique_dashboards: ([.dashboards[].uid] | unique | length),
+  unique_metrics: (.metricsUsed | length),
+  dashboards_with_metrics: (
+    [.dashboards[] | select((.metrics | length) > 0)] | length
+  ),
+  dashboards_with_parse_errors: (
+    [.dashboards[] | select((.parse_errors | length) > 0)] | length
+  )
+}' mimirtool.json
 
-du -h dashboards-all.json
 
-jq -r '.items[].metadata.name' dashboards-all.json |
-  sort | uniq -d
