@@ -1,26 +1,16 @@
-pwd
-
-TENANTS=(
-  Cyber_SHG_MSMS
-  DataService_SHG_MSMS
-  EC_WINDOWS_SHG_MSMS
-  ENS_SHG_MSMS
-  NFRT_LINUX_SHG_MSMS
-  OPENSHIFT-MONITORING
-  OPSTECH_LINUX_SHG_MSMS
-  RPLE_LINUX_SHG_MSFC
-  WTS_SHG_MSMS
-  WTS_WINDOWS_SHG_MSMS
-  msbic-o11y-cshgbi3
+for t in \
+  Cyber_SHG_MSMS \
+  DataService_SHG_MSMS \
+  EC_WINDOWS_SHG_MSMS \
+  ENS_SHG_MSMS \
+  NFRT_LINUX_SHG_MSMS \
+  OPENSHIFT-MONITORING \
+  OPSTECH_LINUX_SHG_MSMS \
+  RPE_LINUX_SHG_MSFC \
+  WTS_SHG_MSMS \
+  WTS_WINDOWS_SHG_MSMS \
+  msbic-o11y-cshgbi3 \
   msms-o11y-cshgms5
-)
-
-for t in "${TENANTS[@]}"; do
-    if [ -d "$PWD/$t" ]; then
-        du -sh "$PWD/$t"
-    else
-        echo "NOT FOUND: $t"
-    fi
+do
+    mv -v "$t" /tmp/mimir-tsdb/ || break
 done
-
-
