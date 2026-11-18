@@ -1,0 +1,136 @@
+FILE="./firewall.json"
+
+# 验证 JSON 格式
+jq empty "$FILE" && echo "JSON valid"
+
+# 查看根对象有哪些字段
+jq -r 'keys_unsorted[]' "$FILE"
+
+# 查看 data 下面有哪些数据集合
+jq -r '.data | keys_unsorted[]' "$FILE"
+
+
+jq -r '
+  .data | to_entries[]
+  | .key as $name
+  | .value
+  | if type == "object" then
+      [
+        $name,
+        (.totalCount // "N/A"),
+        ((.list // []) | length)
+      ] | @tsv
+    else
+      [$name, type, "N/A"] | @tsv
+    end
+' "$FILE"
+
+jq -r '
+  .data | to_entries[]
+  | .key as $name
+  | .value
+  | select(type == "object" and (.list | type) == "array")
+  | .list
+  | "\($name): \(
+      [.[] | select(type == "object") | keys[]]
+      | unique | join(", ")
+    )"
+' "$FILE"
+
+jq -r '
+  [
+    .data.requested_rules.list[]
+    | to_entries[]
+    | [.key, (.value | type)]
+  ]
+  | unique[]
+  | @tsv
+' "$FILE"
+
+jq -r '
+  .data.requested_rules.list
+  | group_by(.status)[]
+  | [.[0].status, length]
+  | @tsv
+' "$FILE"
+
+jq -r '
+  .data.requested_rules.list
+  | group_by(.services)
+  | sort_by(length)
+  | reverse
+  | .[:15][]
+  | [.[0].services, length]
+  | @tsv
+' "$FILE"
+
+jq '
+  .data.requested_rules.list |
+  {
+    rules: length,
+
+    uniqueSourceEONIDs:
+      (map(.sourceEonid) | unique | length),
+
+    uniqueDestinationEONIDs:
+      (map(.destinationEonid) | unique | length),
+
+    uniqueFlowIDs:
+      ([
+        .[]
+        | (.flowIdIds // "")
+        | split(",")[]
+        | gsub("^\\s+|\\s+$"; "")
+        | select(length > 0)
+      ] | unique | length),
+
+    multiFlowRules:
+      (map(
+        select(
+          ((.flowIdIds // "") | split(",") | length) > 1
+        )
+      ) | length),
+
+    multiSourceObjectRules:
+      (map(
+        select(
+          ((.sourceObjectDetails // "") | split(",") | length) > 1
+        )
+      ) | length),
+
+    multiDestinationObjectRules:
+      (map(
+        select(
+          ((.destinationObjectDetails // "") | split(",") | length) > 1
+        )
+      ) | length)
+  }
+' "$FILE"
+
+jq '
+  [
+    .data.requested_rules.list[]
+    | select(
+        (.sourceEonid | tostring) == "299269"
+        and
+        (.destinationEonid | tostring) == "291839"
+      )
+    | {
+        id,
+        status,
+        type,
+        services,
+        sourceObjectDetails,
+        destinationObjectDetails,
+        flowIdIds,
+        ticketId
+      }
+  ][:10]
+' "$FILE"
+
+jq '
+  .data.requested_rules.list[]
+  | select((.id | tostring) == "11055")
+' "$FILE"
+
+
