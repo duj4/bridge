@@ -1,25 +1,35 @@
-jq '
-  def flow_id:
-    (.flowdbIds // "")
-    | tostring
-    | gsub("^\\s+|\\s+$"; "");
+jq -r '
+  .data.requested_rules.list[]
+  | (.flowdbIds // "")
+' $FILE | awk '
+{
+    total++
+    gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
 
-  .data.requested_rules.list as $rules
-  | [$rules[] | flow_id | select(length > 0)] as $refs
-  | ($refs | group_by(.)) as $groups
-  | {
-      totalRules: ($rules | length),
-      rulesWithFlow: ($refs | length),
-      rulesWithoutFlow: (($rules | length) - ($refs | length)),
-      uniqueFlows: ($groups | length),
-      flowsWithMultipleRules:
-        ([$groups[] | select(length > 1)] | length),
-      maxRulesPerFlow:
-        ([$groups[] | length] | max // 0),
-      suspiciousMultiFlowValues:
-        ([$refs[] | select(contains(","))] | length)
+    if ($0 == "") {
+        without++
+        next
     }
-' "$FILE"
+
+    with++
+    if (index($0, ",") > 0) suspicious++
+    flow[$0]++
+}
+END {
+    for (id in flow) {
+        unique++
+        if (flow[id] > 1) multi++
+        if (flow[id] > max) max = flow[id]
+    }
+
+    printf "totalRules: %d\n", total
+    printf "rulesWithFlow: %d\n", with
+    printf "rulesWithoutFlow: %d\n", without
+    printf "uniqueFlows: %d\n", unique
+    printf "flowsWithMultipleRules: %d\n", multi
+    printf "maxRulesPerFlow: %d\n", max
+    printf "suspiciousMultiFlowValues: %d\n", suspicious
+}'
 
 jq '
   def split_groups:
