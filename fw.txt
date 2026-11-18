@@ -1,65 +1,39 @@
-jq -r '
-  .data.requested_rules.list[]
-  | (.flowdbIds // "")
-' $FILE | awk '
-{
-    total++
-    gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
-
-    if ($0 == "") {
-        without++
-        next
-    }
-
-    with++
-    if (index($0, ",") > 0) suspicious++
-    flow[$0]++
-}
-END {
-    for (id in flow) {
-        unique++
-        if (flow[id] > 1) multi++
-        if (flow[id] > max) max = flow[id]
-    }
-
-    printf "totalRules: %d\n", total
-    printf "rulesWithFlow: %d\n", with
-    printf "rulesWithoutFlow: %d\n", without
-    printf "uniqueFlows: %d\n", unique
-    printf "flowsWithMultipleRules: %d\n", multi
-    printf "maxRulesPerFlow: %d\n", max
-    printf "suspiciousMultiFlowValues: %d\n", suspicious
-}'
+jq -r '.data.requested_rules.list[].flowdbIds' "$FILE"
 
 jq '
-  def split_groups:
-    (. // "")
-    | split(",")
-    | map(gsub("^\\s+|\\s+$"; ""))
-    | map(select(length > 0));
-
-  .data.requested_rules.list as $rules
-  | ([$rules[] | .sourceObjectDetails | split_groups[]]) as $src
-  | ([$rules[] | .destinationObjectDetails | split_groups[]]) as $dst
-  | {
-      uniqueSourceGroups: ($src | unique | length),
-      uniqueDestinationGroups: ($dst | unique | length),
-      uniqueTotalGroups: (($src + $dst) | unique | length),
-      totalGroupReferences: (($src | length) + ($dst | length))
-    }
+  [
+    .data.requested_rules.list[].flowdbIds
+    | select(type == "string")
+    | (split("\n") | length - 1)
+  ] | add // 0
 ' "$FILE"
 
 jq '
-  [.data.requested_rules.list[].id] as $ids
-  | {
-      reviewCount: (.data.review_rules.list | length),
-      reviewAlsoInRequested:
-        ([
-          .data.review_rules.list[]
-          | .id
-          | select(. as $id | $ids | index($id) != null)
-        ] | length),
-      reviewStatuses:
-        ([.data.review_rules.list[].status] | unique)
-    }
+  [
+    .data.requested_rules.list[]
+    | select((.flowdbIds // "") | contains(","))
+    | {
+        id,
+        flowdbIds
+      }
+  ][:10]
 ' "$FILE"
+
+jq '
+  .data.requested_rules.list
+  | group_by(.status)
+  | map({
+      status: .[0].status,
+      total: length,
+      withFlow: (
+        [.[] | select((.flowdbIds // "") != "")]
+        | length
+      ),
+      withoutFlow: (
+        [.[] | select((.flowdbIds // "") == "")]
+        | length
+      )
+    })
+' "$FILE"
+
+
