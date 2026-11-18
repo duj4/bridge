@@ -1,39 +1,31 @@
-jq -r '.data.requested_rules.list[].flowdbIds' "$FILE"
-
-jq '
-  [
-    .data.requested_rules.list[].flowdbIds
-    | select(type == "string")
-    | (split("\n") | length - 1)
-  ] | add // 0
-' "$FILE"
-
-jq '
-  [
-    .data.requested_rules.list[]
-    | select((.flowdbIds // "") | contains(","))
-    | {
-        id,
-        flowdbIds
-      }
-  ][:10]
-' "$FILE"
-
 jq '
   .data.requested_rules.list
-  | group_by(.status)
-  | map({
-      status: .[0].status,
+  | map(
+      select((.flowdbIds // "") | contains(","))
+    )
+  | {
       total: length,
-      withFlow: (
-        [.[] | select((.flowdbIds // "") != "")]
-        | length
+      byStatus: (
+        group_by(.status)
+        | map({
+            status: .[0].status,
+            count: length
+          })
       ),
-      withoutFlow: (
-        [.[] | select((.flowdbIds // "") == "")]
-        | length
+      byType: (
+        group_by(.type)
+        | map({
+            type: .[0].type,
+            count: length
+          })
+      ),
+      withLegacyFlowReference: (
+        [
+          .[]
+          | select(
+              (.legacyExcelFlowdbIds // "") != ""
+            )
+        ] | length
       )
-    })
+    }
 ' "$FILE"
-
-
