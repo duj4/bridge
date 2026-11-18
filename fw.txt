@@ -71,3 +71,22 @@ jq '
         (($rules | length) == .data.requested_rules.totalCount)
     }
 ' ./rules.json
+
+
+jq -r '
+  def empty_flow($v):
+    (($v // "") | tostring
+    | gsub("^\\s+|\\s+$"; "")
+    | length) == 0;
+
+  .data.requested_rules.list
+  | map(
+      select(
+        empty_flow(.flowdbIds)
+        and empty_flow(.legacyExcelFlowdbIds)
+      )
+    )
+  | group_by(.status)[]
+  | [.[0].status, length]
+  | @tsv
+' "$FILE"
