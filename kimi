@@ -1,0 +1,244 @@
+Task: FW-EXPLORER-01 — Firewall JSON Structure & Relationship Audit
+
+1. Background
+
+We are planning to develop an internal, read-only web service named Firewall Relationship Explorer.
+
+Our company uses an ESP firewall management system to manage cross-zone network access. The main business entities are:
+
+* Flow: Defines requested traffic flow, including source, destination, protocol and port.
+* Rule: Represents a firewall policy associated with source/destination applications, groups, services and optionally a Flow reference.
+* Group: A collection of network objects. Groups support nested groups and can be referenced by multiple Rules.
+* Application/EONID: Identifies the source or destination application or asset.
+* Zone: Represents network security boundaries.
+
+The ultimate goal is to build a visual, searchable relationship explorer supporting queries such as:
+
+* Application → Destination Applications
+* Application → Rules → Groups
+* Flow → Related Rules
+* Group → Related Rules
+* IP → Nested Groups → Rules (when membership data becomes available)
+
+We currently have an ESP JSON dump containing firewall Rule information.
+
+This task is strictly for data discovery, analysis and validation. Do not start implementing the web service.
+
+2. Environment and Constraints
+
+1. Work only inside the currently authorized Windsurf Workspace.
+2. Locate rules.json inside the Workspace. If the file is absent, report the blocker and stop. Do not fabricate results.
+3. Do not use SSH, remote servers, Git Clone, external APIs or network connections.
+4. Do not modify, reformat or overwrite the original JSON.
+5. Do not install dependencies without authorization.
+6. Prefer Python standard library for analysis. If Python is unavailable, check for existing local alternatives. Do not silently install software.
+7. Do not send or copy the JSON contents outside the authorized Workspace.
+8. Avoid exposing internal IP addresses, employee information or full Group membership details in generated reports.
+9. Clearly distinguish observed facts, inferred relationships and unresolved questions.
+10. Do not assume missing data exists elsewhere.
+
+3. Task A — Discover JSON Structure
+
+Inspect the complete JSON and determine:
+
+* Top-level keys and their data types.
+* Data collections and their actual record counts.
+* Complete field inventory for each collection.
+* Data types encountered for each field.
+* Nullable fields and missing fields.
+* Field population rates.
+* Whether every Rule has a unique ID.
+* Whether collections contain overlapping records.
+
+Produce a clear JSON structure summary.
+
+Do not assume the structure from the examples below. Verify it from the actual file.
+
+4. Task B — Analyze Rule Relationships
+
+Analyze the relationships between:
+
+* Rule ID
+* Source EONID and Application
+* Destination EONID and Application
+* Source Group references
+* Destination Group references
+* services
+* flowdbIds
+* legacyExcelFlowdbIds
+* Ticket ID
+* Rule Status and Type
+
+Important business assumptions:
+
+* One Flow may be referenced by multiple Rules.
+* Normally, one Rule is expected to be associated with one Flow.
+* Some exported records may violate this expectation.
+* A Rule may reference multiple Source and Destination Groups.
+* Nested Groups are supported by ESP, but their actual membership definitions may not be present in the dump.
+* Active means the rule is applied.
+* Pending Implementation means approvals are complete but the rule is not yet applied.
+* Removed means the rule has been decommissioned.
+
+Do not treat assumptions as proof of the exported data’s actual structure.
+
+5. Task C — Flow Reference Analysis
+
+Classify all unique Rules into four mutually exclusive categories:
+
+1. Only flowdbIds populated.
+2. Only legacyExcelFlowdbIds populated.
+3. Both populated.
+4. Neither populated.
+
+Treat null, empty strings and whitespace-only strings as empty.
+
+Validate that the sum of all four categories matches the unique Rule count.
+
+Additionally:
+
+* Count Rules with populated current Flow references.
+* Count Rules with populated legacy Flow references.
+* Identify composite Flow reference values.
+* Detect comma-separated IDs, range expressions and embedded newlines.
+* Identify Rules that share the same Flow reference.
+* Do not automatically treat legacy IDs as equivalent to current Flow IDs.
+* Do not automatically expand range expressions into definitive Flow relationships.
+
+Investigate representative Rules:
+
+* Rule 11055: Expected current Flow reference 10830.
+* Rule 4039: Composite reference 8881,8882,8885,8886.
+* Rule 402: Includes comma-separated references and numeric ranges.
+* Rule 11106: Verify its actual Flow reference; do not assume it is null.
+
+Report any discrepancies against these examples.
+
+6. Task D — Group and Application Analysis
+
+Calculate:
+
+* Unique Source EONIDs.
+* Unique Destination EONIDs.
+* Unique EONIDs across both sides.
+* Unique Source Group names.
+* Unique Destination Group names.
+* Unique Group names across both sides.
+* Total Group references.
+* Rules referencing multiple Source Groups.
+* Rules referencing multiple Destination Groups.
+* Groups reused across different Rules.
+* Groups appearing in both Source and Destination roles.
+
+Analyze whether Group references are represented as comma-separated strings.
+
+Do not assume a Group name alone provides its internal members, nested Group hierarchy, IP addresses or actual Zone.
+
+7. Task E — Validate Dataset Consistency
+
+Check:
+
+* Declared count versus actual count.
+* Duplicate Rule IDs.
+* Overlap between requested_rules and review_rules.
+* Whether overlapping records have identical attributes.
+* Differences in available fields or values, if any.
+* Rule Status distribution.
+* Rule Type distribution.
+* Missing or unusual relationship references.
+* Whether the data can support IP-level and Zone-level visualization without additional exports.
+
+Do not add overlapping records twice.
+
+8. Independent Validation Reference
+
+Perform the analysis independently before comparing with these known reference results.
+
+Previous manual inspection reported:
+
+Metric	Expected
+requested_rules	10,287
+review_rules	33
+Unique Rules after ID deduplication	10,287
+Active Rules	8,684
+Only current Flow reference	2,822
+Only legacy Flow reference	6,471
+Both reference types	656
+Neither reference type	338
+Unique Group names across both sides	3,656
+Total Group references	28,141
+Rules containing comma-separated current Flow references	36
+Rules with neither reference, status Active	292
+
+These are validation checkpoints, not values to hardcode.
+
+If your results differ, investigate and explain the discrepancy rather than forcing a match.
+
+9. Deliverables
+
+Create the following files in the existing Workspace:
+
+A. FIREWALL_JSON_AUDIT.md
+
+A structured Chinese analysis report containing:
+
+1. Executive Summary
+2. JSON Structure
+3. Data Collections
+4. Field Inventory and Data Types
+5. Rule/Flow Relationships
+6. Rule/Group Relationships
+7. Statistical Results
+8. Data Quality Findings
+9. Missing Data and Limitations
+10. Proposed Logical Data Model
+11. Recommended Next Steps
+
+B. firewall_audit.py
+
+A reusable, read-only analysis script that:
+
+* Accepts an input JSON file path.
+* Uses only Python standard library.
+* Performs the principal statistical and consistency checks.
+* Produces deterministic aggregate results.
+* Does not print the complete source data.
+* Handles malformed input with meaningful error messages.
+* Does not overwrite the original file.
+
+C. FIREWALL_AUDIT_RESULTS.json
+
+A machine-readable summary containing actual statistical results, consistency checks and clearly labeled anomalies. Do not include full sensitive Rule or Group contents.
+
+10. Acceptance Criteria
+
+The task is successful only if:
+
+* The input file was actually inspected.
+* Collection sizes and deduplication are verified.
+* All four Flow-reference categories reconcile.
+* Group references are counted correctly.
+* Multi-Flow and range-expression anomalies are identified.
+* Existing dataset limitations are explicitly documented.
+* The analysis script is executed successfully against the provided JSON.
+* Reported numbers are derived from actual execution, not copied from reference values.
+* No source file is modified.
+* No production web service or UI implementation is started.
+
+If any part cannot be completed, report it as NOT VERIFIED with an explanation.
+
+11. Completion Instructions
+
+When finished, provide a concise Chinese HANDOFF containing:
+
+* Overall result: PASS / PARTIAL / BLOCKED.
+* Files created or modified.
+* Commands actually executed.
+* Main findings.
+* Differences versus reference statistics.
+* Unresolved questions.
+* Recommendations for the next development phase.
+
+Do not claim tests passed unless they were actually executed.
+
+Stop after delivering the analysis. Await further instructions before starting implementation.
