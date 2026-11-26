@@ -1,0 +1,184 @@
+验证 1：Rule 是否真的严格符合三个条件
+
+jq -n \
+  --slurpfile raw rules.json \
+  --slurpfile out filter/rules.json '
+  def hit($v; $ids):
+    ($ids | index($v | tostring)) != null;
+
+  [
+    "294098", "298990", "303264",
+    "291839", "310411", "305899",
+    "305690", "306564", "307678"
+  ] as $ids
+
+  | [
+      $raw[0].data.requested_rules.list[]
+      | select(
+          .flowdbIds != null
+          and .legacyExcelFlowdbIds == null
+          and .legacyExcelPolicyId == null
+        )
+      | select(
+          hit(.sourceEonid; $ids)
+          or hit(.destinationEonid; $ids)
+        )
+    ] as $expected
+
+  | ($out[0].data.requested_rules.list) as $actual
+
+  | {
+      expectedCount: ($expected | length),
+      actualCount: ($actual | length),
+      exactMatch: ($expected == $actual),
+      onlyRequestedRules:
+        (($out[0].data | keys) == ["requested_rules"]),
+      metadataCountMatch:
+        ($out[0].data.requested_rules.totalCount
+          == ($actual | length))
+    }
+'
+
+验证 2：Flow 和 Object 是否也准确筛选
+
+jq -n \
+  --slurpfile rawFlows flows.json \
+  --slurpfile filteredFlows filter/flows.json \
+  --slurpfile rawObjects objects.json \
+  --slurpfile filteredObjects filter/objects.json '
+  def hit($v; $ids):
+    ($ids | index($v | tostring)) != null;
+
+  [
+    "294098", "298990", "303264",
+    "291839", "310411", "305899",
+    "305690", "306564", "307678"
+  ] as $ids
+
+  | [
+      $rawFlows[0].data.requested_objects.list[]
+      | select(
+          hit(.sourceEonid; $ids)
+          or hit(.destinationEonid; $ids)
+        )
+    ] as $expectedFlows
+
+  | [
+      $rawObjects[0].data.requested_objects.list[]
+      | select(hit(.eonid; $ids))
+    ] as $expectedObjects
+
+  | {
+      flows: {
+        expected: ($expectedFlows | length),
+        actual: (
+          $filteredFlows[0].data.requested_objects.list
+          | length
+        ),
+        exactMatch: (
+          $expectedFlows
+          == $filteredFlows[0].data.requested_objects.list
+        )
+      },
+      objects: {
+        expected: ($expectedObjects | length),
+        actual: (
+          $filteredObjects[0].data.requested_objects.list
+          | length
+        ),
+        exactMatch: (
+          $expectedObjects
+          == $filteredObjects[0].data.requested_objects.list
+        )
+      }
+    }
+'
+
+关联完整性
+
+jq -r '
+  .data.requested_objects.list[0]
+  | keys_unsorted[]
+' flows.json
+
+jq -n \
+  --slurpfile rule filter/rules.json \
+  --slurpfile flow filter/flows.json \
+  --slurpfile full flows.json '
+  (
+    [$flow[0].data.requested_objects.list[].id | tostring]
+    | unique
+  ) as $kept
+
+  | (
+      [$full[0].data.requested_objects.list[].id | tostring]
+      | unique
+    ) as $all
+
+  | [
+      $rule[0].data.requested_rules.list[]
+      | select(
+          (.flowdbIds // "" | tostring)
+          | test("^[0-9]+$")
+        )
+      | {
+          rule: .id,
+          fid: (.flowdbIds | tostring)
+        }
+    ] as $refs
+
+  | [
+      $flow[0].data.requested_objects.list[]
+      | select(
+          .oldFlowid != null
+          and (.oldFlowid | tostring) != ""
+        )
+      | {
+          flow: .id,
+          prev: (.oldFlowid | tostring)
+        }
+    ] as $prev
+
+  | {
+      singleFlowRuleRefs: ($refs | length),
+
+      ruleRefsMissingInFiltered: (
+        [$refs[]
+         | .fid as $f
+         | select(($kept | index($f)) == null)]
+        | length
+      ),
+
+      ruleRefsMissingEvenInOriginal: (
+        [$refs[]
+         | .fid as $f
+         | select(($all | index($f)) == null)]
+        | length
+      ),
+
+      flowsWithOldFlowid: ($prev | length),
+
+      prevMissingInFiltered: (
+        [$prev[]
+         | .prev as $p
+         | select(($kept | index($p)) == null)]
+        | length
+      ),
+
+      prevMissingEvenInOriginal: (
+        [$prev[]
+         | .prev as $p
+         | select(($all | index($p)) == null)]
+        | length
+      )
+    }
+'
+
+Group 还需要进一步核对
+
+jq -r '
+  .data.requested_objects.list[0]
+  | keys_unsorted[]
+' objects.json
+
+
