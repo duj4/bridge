@@ -1,186 +1,14 @@
 jq -n \
-  --slurpfile n graph/node.json \
-  --slurpfile e graph/edge.json '
-  ($n[0].nodes) as $nodes
-  | ($e[0].edges) as $edges
-  | (reduce $nodes[] as $x ({}; .[$x.id] = true)) as $nodeIndex
-  | {
-      declaredNodes: $n[0].nodeCount,
-      actualNodes: ($nodes | length),
-      declaredEdges: $e[0].edgeCount,
-      actualEdges: ($edges | length),
-
-      nodesCountMatch: ($n[0].nodeCount == ($nodes | length)),
-      edgesCountMatch: ($e[0].edgeCount == ($edges | length)),
-
-      duplicateNodeIDs:
-        (($nodes | length) - ([$nodes[].id] | unique | length)),
-
-      duplicateEdgeIDs:
-        (($edges | length) - ([$edges[].id] | unique | length)),
-
-      missingSourceNodes:
-        ([$edges[] | select(($nodeIndex[.source] // false) | not)] | length),
-
-      missingTargetNodes:
-        ([$edges[] | select(($nodeIndex[.target] // false) | not)] | length),
-
-      duplicateLogicalEdges:
-        (($edges | length) -
-         ([$edges[] | [.source, .type, .target]] | unique | length)),
-
-      nodeTypes:
-        ($nodes | group_by(.type) | map({type: .[0].type, count: length})),
-
-      edgeTypes:
-        ($edges | group_by(.type) | map({type: .[0].type, count: length}))
-    }
-'
-
-jq -n \
-  --slurpfile n graph/node.json \
-  --slurpfile r filter/rules.json \
-  --slurpfile f filter/flows.json \
-  --slurpfile p filter/objects.json \
-  --slurpfile rel filter/related_objects.json \
-  --slurpfile nest filter/nested_objects.json '
-  ($n[0].nodes) as $nodes
-
-  | ([$r[0].data.requested_rules.list[] | "rule:\(.id)"] | sort) as $ruleIds
-
-  | ([$f[0].data.requested_objects.list[] | "flow:\(.flowid)"] | sort) as $flowIds
-
-  | (
-      $p[0].data.requested_objects.list
-      + $rel[0].data.requested_objects.list
-      + $nest[0].data.requested_objects.list
-    ) as $groups
-
-  | ([$groups[] | "group:\(.id)"] | sort) as $groupIds
-
-  | {
-      ruleNodeExact:
-        (($nodes | map(select(.type == "RULE") | .id) | sort) == $ruleIds),
-
-      flowNodeExact:
-        (($nodes | map(select(.type == "FLOW") | .id) | sort) == $flowIds),
-
-      groupNodeExact:
-        (($nodes | map(select(.type == "GROUP") | .id) | sort) == $groupIds),
-
-      ruleCount: ($ruleIds | length),
-      flowCount: ($flowIds | length),
-      groupCount: ($groupIds | length),
-
-      duplicateGroupIDs:
-        (($groupIds | length) - ($groupIds | unique | length)),
-
-      flow98InGraph:
-        ([$nodes[] | select(.id == "flow:98")] | length)
-    }
-'
-
-jq -n \
-  --slurpfile r filter/rules.json \
-  --slurpfile e graph/edge.json '
-  def trim: gsub("^\\s+|\\s+$"; "");
-
-  [
-    $r[0].data.requested_rules.list[] as $r
-    | (($r.flowdbIds // "") | split(",") | map(trim)) as $ids
-    | $ids[]
-    | select(length > 0)
-    | {
-        source: "rule:\($r.id)",
-        target: "flow:\(.)",
-        type: (
-          if ($ids | length) == 1
-          then "RULE_REFERENCES_FLOW"
-          else "RULE_CANDIDATE_FLOW_REFERENCE"
-          end
-        )
-      }
-  ] as $expected
-
-  | [
-      $e[0].edges[]
-      | select(
-          .type == "RULE_REFERENCES_FLOW"
-          or .type == "RULE_CANDIDATE_FLOW_REFERENCE"
-        )
-      | {source, target, type}
-    ] as $actual
-
-  | {
-      expectedFlowEdges: ($expected | length),
-      actualFlowEdges: ($actual | length),
-      candidateFlowEdges:
-        ([$actual[] | select(.type == "RULE_CANDIDATE_FLOW_REFERENCE")] | length),
-      exactMatch: (($expected | sort) == ($actual | sort))
-    }
-'
-
-jq -n \
-  --slurpfile r filter/rules.json \
-  --slurpfile o raw/objects.json \
-  --slurpfile e graph/edge.json '
-  def members:
-    (. // "")
-    | split(",")
-    | map(gsub("^\\s+|\\s+$"; ""))[]
-    | select(length > 0);
-
-  (reduce $o[0].data.requested_objects.list[] as $obj
-    ({}; .[$obj.name] = $obj.id)) as $names
-
-  | [
-      $r[0].data.requested_rules.list[] as $rule
-      | [
-          {field: "sourceObjectDetails", type: "RULE_USES_SOURCE_GROUP"},
-          {field: "destinationObjectDetails", type: "RULE_USES_DESTINATION_GROUP"}
-        ][] as $spec
-      | ($rule[$spec.field] | members) as $name
-      | {
-          source: "rule:\($rule.id)",
-          target: (
-            if $names[$name] == null
-            then "MISSING:\($name)"
-            else "group:\($names[$name])"
-            end
-          ),
-          type: $spec.type
-        }
-    ] as $expected
-
-  | [
-      $e[0].edges[]
-      | select(
-          .type == "RULE_USES_SOURCE_GROUP"
-          or .type == "RULE_USES_DESTINATION_GROUP"
-        )
-      | {source, target, type}
-    ] as $actual
-
-  | {
-      expectedGroupEdges: ($expected | length),
-      actualGroupEdges: ($actual | length),
-      unknownGroupReferences:
-        ([$expected[] | select(.target | startswith("MISSING:"))] | length),
-      exactMatch: (($expected | sort) == ($actual | sort))
-    }
-'
-
-jq -n \
+  --slurpfile raw raw/objects.json \
   --slurpfile p filter/objects.json \
   --slurpfile rel filter/related_objects.json \
   --slurpfile nest filter/nested_objects.json \
-  --slurpfile o raw/objects.json \
   --slurpfile e graph/edge.json '
   def tokens:
-    (. // "")
-    | split(",")
-    | map(gsub("^\\s+|\\s+$"; ""))[]
-    | select(length > 0);
+    (. // "" | tostring
+    | split(",")[]
+    | gsub("^\\s+|\\s+$"; "")
+    | select(length > 0));
 
   (
     $p[0].data.requested_objects.list
@@ -188,30 +16,71 @@ jq -n \
     + $nest[0].data.requested_objects.list
   ) as $scope
 
-  | (reduce $o[0].data.requested_objects.list[] as $x
-      ({}; .[$x.name] = $x.id)) as $allByName
+  | (
+    reduce $raw[0].data.requested_objects.list[] as $o
+      ({}; .[$o.name] = $o.id)
+  ) as $byName
 
   | [
       $scope[] as $parent
-      | ($parent.ipAddresses | tokens) as $tok
-      | select($allByName[$tok] != null)
+      | ($parent.ipAddresses | tokens) as $token
+      | $byName[$token] as $child
+      | select($child != null)
       | {
           source: "group:\($parent.id)",
-          target: "group:\($allByName[$tok])",
+          target: "group:\($child)",
           type: "GROUP_CONTAINS_GROUP"
         }
-    ] as $expected
+    ] | sort as $expected
 
   | [
       $e[0].edges[]
       | select(.type == "GROUP_CONTAINS_GROUP")
       | {source, target, type}
-    ] as $actual
+    ] | sort as $actual
 
   | {
       expectedNestedEdges: ($expected | length),
       actualNestedEdges: ($actual | length),
-      exactMatch: (($expected | sort) == ($actual | sort))
+      exactMatch: ($expected == $actual)
+    }
+'
+
+jq -n \
+  --slurpfile f filter/flows.json \
+  --slurpfile e graph/edge.json '
+  ($f[0].data.requested_objects.list) as $flows
+
+  | (
+      reduce $flows[] as $x
+        ({}; .[($x.flowid | tostring)] = true)
+    ) as $idx
+
+  | [
+      $flows[] as $x
+      | ($x.oldFlowid // "" | tostring) as $old
+      | select(
+          $old != ""
+          and $old != "0"
+          and ($idx[$old] // false)
+        )
+      | {
+          source: "flow:\($x.flowid)",
+          target: "flow:\($old)",
+          type: "FLOW_PREVIOUS_VERSION"
+        }
+    ] | sort as $expected
+
+  | [
+      $e[0].edges[]
+      | select(.type == "FLOW_PREVIOUS_VERSION")
+      | {source, target, type}
+    ] | sort as $actual
+
+  | {
+      expectedEvolutionEdges: ($expected | length),
+      actualEvolutionEdges: ($actual | length),
+      exactMatch: ($expected == $actual)
     }
 '
 
