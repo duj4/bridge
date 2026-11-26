@@ -1,184 +1,82 @@
-验证 1：Rule 是否真的严格符合三个条件
+重新验证 Rule → Flow → Previous Flow
 
 jq -n \
-  --slurpfile raw rules.json \
-  --slurpfile out filter/rules.json '
-  def hit($v; $ids):
-    ($ids | index($v | tostring)) != null;
+  --slurpfile r filter/rules.json \
+  --slurpfile f filter/flows.json \
+  --slurpfile a flows.json '
+  def norm:
+    if . == null then ""
+    else tostring | gsub("^\\s+|\\s+$"; "")
+    end;
 
-  [
-    "294098", "298990", "303264",
-    "291839", "310411", "305899",
-    "305690", "306564", "307678"
-  ] as $ids
+  ($r[0].data.requested_rules.list) as $rs
+  | ($f[0].data.requested_objects.list) as $ff
+  | ($a[0].data.requested_objects.list) as $af
 
-  | [
-      $raw[0].data.requested_rules.list[]
-      | select(
-          .flowdbIds != null
-          and .legacyExcelFlowdbIds == null
-          and .legacyExcelPolicyId == null
-        )
-      | select(
-          hit(.sourceEonid; $ids)
-          or hit(.destinationEonid; $ids)
-        )
-    ] as $expected
-
-  | ($out[0].data.requested_rules.list) as $actual
-
-  | {
-      expectedCount: ($expected | length),
-      actualCount: ($actual | length),
-      exactMatch: ($expected == $actual),
-      onlyRequestedRules:
-        (($out[0].data | keys) == ["requested_rules"]),
-      metadataCountMatch:
-        ($out[0].data.requested_rules.totalCount
-          == ($actual | length))
-    }
-'
-
-验证 2：Flow 和 Object 是否也准确筛选
-
-jq -n \
-  --slurpfile rawFlows flows.json \
-  --slurpfile filteredFlows filter/flows.json \
-  --slurpfile rawObjects objects.json \
-  --slurpfile filteredObjects filter/objects.json '
-  def hit($v; $ids):
-    ($ids | index($v | tostring)) != null;
-
-  [
-    "294098", "298990", "303264",
-    "291839", "310411", "305899",
-    "305690", "306564", "307678"
-  ] as $ids
+  | ([$ff[].flowid | norm] | unique) as $kept
+  | ([$af[].flowid | norm] | unique) as $all
 
   | [
-      $rawFlows[0].data.requested_objects.list[]
-      | select(
-          hit(.sourceEonid; $ids)
-          or hit(.destinationEonid; $ids)
-        )
-    ] as $expectedFlows
-
-  | [
-      $rawObjects[0].data.requested_objects.list[]
-      | select(hit(.eonid; $ids))
-    ] as $expectedObjects
-
-  | {
-      flows: {
-        expected: ($expectedFlows | length),
-        actual: (
-          $filteredFlows[0].data.requested_objects.list
-          | length
-        ),
-        exactMatch: (
-          $expectedFlows
-          == $filteredFlows[0].data.requested_objects.list
-        )
-      },
-      objects: {
-        expected: ($expectedObjects | length),
-        actual: (
-          $filteredObjects[0].data.requested_objects.list
-          | length
-        ),
-        exactMatch: (
-          $expectedObjects
-          == $filteredObjects[0].data.requested_objects.list
-        )
-      }
-    }
-'
-
-关联完整性
-
-jq -r '
-  .data.requested_objects.list[0]
-  | keys_unsorted[]
-' flows.json
-
-jq -n \
-  --slurpfile rule filter/rules.json \
-  --slurpfile flow filter/flows.json \
-  --slurpfile full flows.json '
-  (
-    [$flow[0].data.requested_objects.list[].id | tostring]
-    | unique
-  ) as $kept
-
-  | (
-      [$full[0].data.requested_objects.list[].id | tostring]
-      | unique
-    ) as $all
-
-  | [
-      $rule[0].data.requested_rules.list[]
-      | select(
-          (.flowdbIds // "" | tostring)
-          | test("^[0-9]+$")
-        )
-      | {
-          rule: .id,
-          fid: (.flowdbIds | tostring)
-        }
+      $rs[]
+      | {rule: .id, ref: (.flowdbIds | norm)}
     ] as $refs
 
   | [
-      $flow[0].data.requested_objects.list[]
-      | select(
-          .oldFlowid != null
-          and (.oldFlowid | tostring) != ""
-        )
-      | {
-          flow: .id,
-          prev: (.oldFlowid | tostring)
-        }
+      $refs[]
+      | select(.ref | test("^[0-9]+$"))
+    ] as $simple
+
+  | [
+      $refs[]
+      | select((.ref | test("^[0-9]+$")) | not)
+    ] as $other
+
+  | [
+      $ff[]
+      | {flow: .flowid, prev: (.oldFlowid | norm)}
+      | select(.prev != "" and .prev != "0")
     ] as $prev
 
   | {
-      singleFlowRuleRefs: ($refs | length),
+      totalRules: ($rs | length),
+      singleIdRuleRefs: ($simple | length),
+      nonSingleIdRefs: ($other | length),
+      nonSingleIdExamples: ($other | .[:5]),
 
-      ruleRefsMissingInFiltered: (
-        [$refs[]
-         | .fid as $f
-         | select(($kept | index($f)) == null)]
-        | length
-      ),
+      ruleRefsFoundInFiltered:
+        ([$simple[]
+          | select(.ref as $id | $kept | index($id) != null)
+        ] | length),
 
-      ruleRefsMissingEvenInOriginal: (
-        [$refs[]
-         | .fid as $f
-         | select(($all | index($f)) == null)]
-        | length
-      ),
+      ruleRefsOnlyInOriginal:
+        ([$simple[]
+          | select(.ref as $id
+            | ($all | index($id) != null)
+              and ($kept | index($id) == null))
+        ] | length),
+
+      ruleRefsMissingInOriginal:
+        ([$simple[]
+          | select(.ref as $id | $all | index($id) == null)
+        ] | length),
 
       flowsWithOldFlowid: ($prev | length),
 
-      prevMissingInFiltered: (
-        [$prev[]
-         | .prev as $p
-         | select(($kept | index($p)) == null)]
-        | length
-      ),
+      previousFoundInFiltered:
+        ([$prev[]
+          | select(.prev as $id | $kept | index($id) != null)
+        ] | length),
 
-      prevMissingEvenInOriginal: (
-        [$prev[]
-         | .prev as $p
-         | select(($all | index($p)) == null)]
-        | length
-      )
+      previousOnlyInOriginal:
+        ([$prev[]
+          | select(.prev as $id
+            | ($all | index($id) != null)
+              and ($kept | index($id) == null))
+        ] | length),
+
+      previousMissingInOriginal:
+        ([$prev[]
+          | select(.prev as $id | $all | index($id) == null)
+        ] | length)
     }
 '
-
-Group 还需要进一步核对
-
-jq -r '
-  .data.requested_objects.list[0]
-  | keys_unsorted[]
-' objects.json
-
-
