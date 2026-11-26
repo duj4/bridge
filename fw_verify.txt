@@ -1,87 +1,127 @@
-jq -n \
-  --slurpfile raw raw/objects.json \
-  --slurpfile p filter/objects.json \
-  --slurpfile rel filter/related_objects.json \
-  --slurpfile nest filter/nested_objects.json \
-  --slurpfile e graph/edge.json '
-  def tokens:
-    (. // "" | tostring
-    | split(",")[]
-    | gsub("^\\s+|\\s+$"; "")
-    | select(length > 0));
+python3 - <<'PY'
+import json
+import ipaddress
+from collections import Counter
 
-  (
-    $p[0].data.requested_objects.list
-    + $rel[0].data.requested_objects.list
-    + $nest[0].data.requested_objects.list
-  ) as $scope
+def load(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
-  | (
-    reduce $raw[0].data.requested_objects.list[] as $o
-      ({}; .[$o.name] = $o.id)
-  ) as $byName
+paths = [
+    "filter/objects.json",
+    "filter/related_objects.json",
+    "filter/nested_objects.json",
+]
 
-  | [
-      $scope[] as $parent
-      | ($parent.ipAddresses | tokens) as $token
-      | $byName[$token] as $child
-      | select($child != null)
-      | {
-          source: "group:\($parent.id)",
-          target: "group:\($child)",
-          type: "GROUP_CONTAINS_GROUP"
-        }
-    ] | sort as $expected
+groups = []
+for path in paths:
+    groups.extend(load(path)["data"]["requested_objects"]["list"])
 
-  | [
-      $e[0].edges[]
-      | select(.type == "GROUP_CONTAINS_GROUP")
-      | {source, target, type}
-    ] | sort as $actual
+raw_names = {
+    obj["name"]
+    for obj in load("raw/objects.json")["data"]["requested_objects"]["list"]
+}
 
-  | {
-      expectedNestedEdges: ($expected | length),
-      actualNestedEdges: ($actual | length),
-      exactMatch: ($expected == $actual)
-    }
-'
+expected = set()
+unresolved = []
 
-jq -n \
-  --slurpfile f filter/flows.json \
-  --slurpfile e graph/edge.json '
-  ($f[0].data.requested_objects.list) as $flows
+def classify(token):
+    try:
+        addr = ipaddress.ip_address(token)
+        return "GROUP_CONTAINS_IP", f"ip:{addr}"
+    except ValueError:
+        pass
 
-  | (
-      reduce $flows[] as $x
-        ({}; .[($x.flowid | tostring)] = true)
-    ) as $idx
+    if "/" in token:
+        try:
+            network = ipaddress.ip_network(token, strict=False)
+            return "GROUP_CONTAINS_CIDR", f"cidr:{network}"
+        except ValueError:
+            pass
 
-  | [
-      $flows[] as $x
-      | ($x.oldFlowid // "" | tostring) as $old
-      | select(
-          $old != ""
-          and $old != "0"
-          and ($idx[$old] // false)
-        )
-      | {
-          source: "flow:\($x.flowid)",
-          target: "flow:\($old)",
-          type: "FLOW_PREVIOUS_VERSION"
-        }
-    ] | sort as $expected
+    if "-" in token:
+        try:
+            left, right = token.split("-", 1)
+            start = ipaddress.ip_address(left.strip())
+            end = ipaddress.ip_address(right.strip())
 
-  | [
-      $e[0].edges[]
-      | select(.type == "FLOW_PREVIOUS_VERSION")
-      | {source, target, type}
-    ] | sort as $actual
+            if start.version == end.version and int(start) <= int(end):
+                return (
+                    "GROUP_CONTAINS_IP_RANGE",
+                    f"ip-range:{start}-{end}"
+                )
+        except ValueError:
+            pass
 
-  | {
-      expectedEvolutionEdges: ($expected | length),
-      actualEvolutionEdges: ($actual | length),
-      exactMatch: ($expected == $actual)
-    }
-'
+    return None
 
+for group in groups:
+    source = f"group:{group['id']}"
 
+    for value in (group.get("ipAddresses") or "").split(","):
+        token = value.strip()
+        if not token:
+            continue
+
+        if token in raw_names:
+            continue
+
+        result = classify(token)
+
+        if result is None:
+            unresolved.append(group["id"])
+            continue
+
+        edge_type, target = result
+        expected.add((source, target, edge_type))
+
+member_types = {
+    "GROUP_CONTAINS_IP",
+    "GROUP_CONTAINS_CIDR",
+    "GROUP_CONTAINS_IP_RANGE",
+}
+
+actual_edges = [
+    e for e in load("graph/edge.json")["edges"]
+    if e["type"] in member_types
+]
+
+actual = {
+    (e["source"], e["target"], e["type"])
+    for e in actual_edges
+}
+
+missing = expected - actual
+extra = actual - expected
+
+nodes = {
+    n["id"]: n["type"]
+    for n in load("graph/node.json")["nodes"]
+}
+
+target_types = {
+    "GROUP_CONTAINS_IP": "IP",
+    "GROUP_CONTAINS_CIDR": "CIDR",
+    "GROUP_CONTAINS_IP_RANGE": "IP_RANGE",
+}
+
+wrong_types = sum(
+    nodes.get(e["target"]) != target_types[e["type"]]
+    for e in actual_edges
+)
+
+result = {
+    "groupCount": len(groups),
+    "expectedMemberEdges": len(expected),
+    "actualMemberEdges": len(actual_edges),
+    "expectedByType": dict(Counter(x[2] for x in expected)),
+    "actualByType": dict(Counter(e["type"] for e in actual_edges)),
+    "missingEdges": len(missing),
+    "unexpectedEdges": len(extra),
+    "unresolvedTokens": len(unresolved),
+    "wrongTargetNodeTypes": wrong_types,
+    "exactMatch": expected == actual,
+}
+
+print(json.dumps(result, indent=2))
+PY
