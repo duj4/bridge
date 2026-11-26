@@ -1,32 +1,46 @@
-jq '{
-  topLevelKeys: keys_unsorted,
-  topLevelTypes: with_entries(.value |= type),
-  arrayPaths: [
-    paths(type == "array")
-    | map(tostring)
-    | join(".")
-  ]
-}' filter/relationship_audit.json
+jq '
+  .data.requested_objects.list as $objects
+  | ($objects | map(.name)) as $names
+  | [
+      $objects[]
+      | . as $parent
+      | [
+          ($parent.ipAddresses // "")
+          | split(",")
+          | map(gsub("^\\s+|\\s+$"; ""))
+          | .[]
+          | select(startswith("grp"))
+          | . as $candidate
+          | select(($names | index($candidate)) != null)
+          | $candidate
+        ] as $children
+      | select(($children | length) > 0)
+      | {
+          parentId: $parent.id,
+          parentName: $parent.name,
+          parentEonid: $parent.eonid,
+          candidateNestedGroups: $children
+        }
+    ]
+' objects.json
 
-for f in filter/related_objects.json filter/historical_flows.json; do
-    echo "========== $f =========="
-
-    jq '{
-      topLevelKeys: keys_unsorted,
-      dataKeys: (
-        if (.data | type) == "object"
-        then (.data | keys_unsorted)
-        else []
-        end
-      ),
-      arrayPaths: [
-        paths(type == "array")
-        | map(tostring)
-        | join(".")
-      ]
-    }' "$f"
-done
-
-jq '.' filter/relationship_audit.json
-
-
+jq '
+  [
+    .data.requested_objects.list[]
+    | select((.flowid | tostring) == "98")
+    | {
+        flowid,
+        oldFlowid,
+        sourceEonid,
+        destinationEonid,
+        sourceSecurityZone,
+        destinationSecurityZone,
+        servicesAndPorts
+      }
+  ] as $records
+  | {
+      recordCount: ($records | length),
+      distinctVersions: ($records | unique | length),
+      records: $records
+    }
+' flows.json
