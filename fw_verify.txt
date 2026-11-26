@@ -1,46 +1,133 @@
-jq '
-  .data.requested_objects.list as $objects
-  | ($objects | map(.name)) as $names
+jq -n \
+  --slurpfile raw objects.json \
+  --slurpfile p filter/objects.json \
+  --slurpfile rel filter/related_objects.json '
+  ($raw[0].data.requested_objects.list) as $all
+  | (
+      $p[0].data.requested_objects.list
+      + $rel[0].data.requested_objects.list
+    ) as $scope
+
+  | (reduce $all[] as $o (
+      {};
+      .[$o.name] = $o
+    )) as $byName
+
+  | ([$scope[].id | tostring] | unique) as $scopeIds
+
   | [
-      $objects[]
-      | . as $parent
-      | [
+      $scope[] as $parent
+      | (
           ($parent.ipAddresses // "")
+          | tostring
           | split(",")
           | map(gsub("^\\s+|\\s+$"; ""))
           | .[]
-          | select(startswith("grp"))
-          | . as $candidate
-          | select(($names | index($candidate)) != null)
-          | $candidate
-        ] as $children
-      | select(($children | length) > 0)
+        ) as $token
+
+      | select($token | startswith("grp"))
+
+      | $byName[$token] as $child
+      | select($child != null)
+
       | {
           parentId: $parent.id,
           parentName: $parent.name,
           parentEonid: $parent.eonid,
-          candidateNestedGroups: $children
+          childId: $child.id,
+          childName: $child.name,
+          childEonid: $child.eonid,
+          childInScope: (
+            ($scopeIds | index($child.id | tostring)) != null
+          )
         }
-    ]
-' objects.json
+    ] as $edges
+
+  | {
+      scopeObjects: ($scope | length),
+
+      candidateEdgeInstances: ($edges | length),
+
+      uniqueParentChildEdges:
+        ([$edges[] | [.parentId, .childId]] | unique | length),
+
+      parentObjectsWithNestedGroups:
+        ([$edges[].parentId] | unique | length),
+
+      uniqueChildGroups:
+        ([$edges[].childId] | unique | length),
+
+      uniqueChildGroupsInScope:
+        ([$edges[] | select(.childInScope) | .childId] | unique | length),
+
+      uniqueChildGroupsOutsideScope:
+        ([$edges[] | select(.childInScope | not) | .childId] | unique | length),
+
+      examples: $edges[:10]
+    }
+'
 
 jq '
   [
     .data.requested_objects.list[]
     | select((.flowid | tostring) == "98")
-    | {
-        flowid,
-        oldFlowid,
-        sourceEonid,
-        destinationEonid,
-        sourceSecurityZone,
-        destinationSecurityZone,
-        servicesAndPorts
-      }
-  ] as $records
+  ] as $r
+
   | {
-      recordCount: ($records | length),
-      distinctVersions: ($records | unique | length),
-      records: $records
+      recordCount: ($r | length),
+
+      uniqueFullRecords:
+        ($r | unique | length),
+
+      duplicateCopies:
+        (($r | length) - ($r | unique | length)),
+
+      fieldsWithDifferentValues: [
+        ($r[0] | keys_unsorted[]) as $k
+        | select(
+            ([$r[] | .[$k]] | unique | length) > 1
+          )
+        | $k
+      ]
     }
 ' flows.json
+
+jq -n \
+  --slurpfile tr filter/rules.json \
+  --slurpfile ar rules.json \
+  --slurpfile tf filter/flows.json \
+  --slurpfile af flows.json '
+  def has98($v):
+    (($v // "") | tostring
+     | split(",")
+     | map(gsub("^\\s+|\\s+$"; ""))
+     | index("98")) != null;
+
+  {
+    teamRulesReferencing98: [
+      $tr[0].data.requested_rules.list[]
+      | select(has98(.flowdbIds))
+      | .id
+    ],
+
+    allRulesReferencing98: [
+      $ar[0].data.requested_rules.list[]
+      | select(has98(.flowdbIds))
+      | .id
+    ],
+
+    teamFlowsPointingTo98: [
+      $tf[0].data.requested_objects.list[]
+      | select((.oldFlowid | tostring) == "98")
+      | .flowid
+    ],
+
+    allFlowsPointingTo98: [
+      $af[0].data.requested_objects.list[]
+      | select((.oldFlowid | tostring) == "98")
+      | .flowid
+    ]
+  }
+'
+
+
