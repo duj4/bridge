@@ -1,29 +1,518 @@
-jq -n \
-  --slurpfile r filter/rules.json \
-  --slurpfile o objects.json '
-  def names:
-    (. // "")
-    | split(",")
-    | map(gsub("^\\s+|\\s+$"; ""))
-    | map(select(length > 0))[];
+# FW-EXPLORER-02 — Relationship Dependency Closure
 
-  ([
-    $r[0].data.requested_rules.list[]
-    | (.sourceObjectDetails, .destinationObjectDetails)
-    | names
-  ] | unique) as $wanted
+## 一、任务背景
 
-  | [
-      $o[0].data.requested_objects.list[]
-      | select(.name as $n | $wanted | index($n) != null)
-      | select(.type == "DECO" or .status != "Active")
-      | {
-          id,
-          name,
-          eonid,
-          status,
-          type,
-          isDeleted
-        }
-    ]
-'
+我们正在开发一个内部只读 Web Service：**Firewall Relationship Explorer**。
+
+目标是将 ESP Firewall 数据中的 Application、EONID、Flow、Rule、Group、IP 和 Zone 关联起来，并提供可视化查询。
+
+FW-EXPLORER-01 已完成基础数据分析。
+
+随后我们根据 ESP 开发人员确认的业务要求，执行了第一轮数据清洗，并完成独立验证。
+
+本轮任务是第二阶段：**Relationship Dependency Resolution & Integrity Audit**。
+
+核心目标：
+
+在不改变已有 Primary Dataset 和 Team Scope 的前提下，补充 Rule 引用的外部 Group，以及 Flow 历史演化所需的前驱数据。
+
+本轮不开发 Web UI，不设计数据库，不实现查询 API。
+
+## 二、已确认的业务规则
+
+### 1. Rule
+
+只使用 `rules.json` 中的：
+
+`data.requested_rules.list`
+
+不使用 `review_rules`。
+
+当前 Rule 必须同时满足：
+
+- `flowdbIds` 非空
+- `legacyExcelFlowdbIds` 为空
+- `legacyExcelPolicyId` 为空
+
+只关注以下 9 个 Team EONID：
+
+```text
+294098
+298990
+303264
+291839
+310411
+305899
+305690
+306564
+307678
+```
+
+Source 或 Destination 任意一端命中，即属于 Team Scope。
+
+不得擅自将规则改为两端必须同时命中。
+
+### 2. Flow
+
+Flow 的主键是：
+
+`flowid`
+
+不是 `id`。
+
+Flow 使用：
+
+`oldFlowid`
+
+引用更早的 Flow，从而形成历史演化关系。
+
+Rule 通过 `flowdbIds` 引用当前 Flow。
+
+本轮必须支持沿 `oldFlowid` 逐级向前追溯历史，但不得把原始 `flows.json` 中所有无关的历史记录加入依赖数据。
+
+### 3. Group / Object
+
+Group 使用：
+
+- `id`：Object ID
+- `name`：Group Name
+- `eonid`：所属 EONID
+- `ipAddresses`：IP 成员数据
+- `parentIds`、`childIds`：潜在层级字段
+
+Rule 使用 `sourceObjectDetails` 和 `destinationObjectDetails` 引用 Group 名称，多个名称以逗号分隔。
+
+ESP 业务上支持 Nested Group。
+
+但当前导出中，4,198 条 Object 的 `parentIds` 和 `childIds` 均为 null。
+
+不得根据业务支持 Nested Group 这一事实，擅自构造导出数据中不存在的父子关系。
+
+### 4. 状态
+
+- Active：已经应用的 Firewall Rule
+- Pending Implementation：审批完成但尚未应用
+- Removed：已 DECO
+
+保留原始状态和操作类型。
+
+不要把 `type = DECO` 自动等同于 `isDeleted = 1`。
+
+## 三、当前数据及已完成验证
+
+Workspace 中包含：
+
+```text
+rules.json
+flows.json
+objects.json
+filter_data.py
+
+filter/
+    rules.json
+    flows.json
+    objects.json
+    _filter_summary.json
+```
+
+当前 Primary Dataset：
+
+| Dataset | 原始数量 | 过滤后 |
+|---|---:|---:|
+| Rules | 10,287 | 261 |
+| Flows | 9,862 | 1,088 |
+| Objects | 4,198 | 162 |
+
+以下独立检查已完成：
+
+1. Rule 筛选结果逐条精确匹配：PASS。
+2. Flow 筛选结果逐条精确匹配：PASS。
+3. Object 筛选结果逐条精确匹配：PASS。
+4. 259 条单值 Rule → Flow 引用全部可解析。
+5. 另外 2 条 Rule 使用复合 Flow 引用。
+6. 2 条复合 Rule 各引用 8 个 Flow ID，全部存在于过滤后的 Flow 数据中。
+7. 261 条 Rule 引用了 269 个不同 Group Name。
+8. 108 个 Group 在 Primary Objects 中。
+9. 另外 161 个 Group 仅存在于原始 Objects 中。
+10. 原始 Objects 覆盖全部 269 个 Group Name。
+11. 原始 Object Name 没有重复。
+12. 原始数据中 107 条已过滤 Flow 有直接 `oldFlowid`，其中 106 个前驱在过滤数据中，1 个仅在原始数据中。
+
+已知特殊数据：
+
+- Rule 7873 和 7869：`flowdbIds` 都包含 `5790,5792,5794,5853,5789,5791,5793,5852`。
+- Flow 6472：`oldFlowid = 5554`。
+- Flow 5554 在原始数据中，但不属于当前 Team EONID 筛选结果。
+- Flow 6472 不被当前 261 条 Rule 直接引用，但还没有验证它是否位于其他 Rule 的完整历史演化链中。
+
+这些结果是参考基线，必须通过实际文件验证，不得硬编码。
+
+## 四、执行边界
+
+### 必须保持不变
+
+以下文件全部视为冻结输入：
+
+```text
+rules.json
+flows.json
+objects.json
+filter_data.py
+
+filter/rules.json
+filter/flows.json
+filter/objects.json
+filter/_filter_summary.json
+```
+
+要求：
+
+1. 开始前记录冻结文件 SHA-256。
+2. 结束后重新计算并逐项比较。
+3. 任何冻结文件发生变化，任务必须停止并报告。
+4. 不重新执行或修改 Primary Filtering。
+5. 不修改原始 ESP JSON。
+6. 不覆盖现有审计文件。
+7. 不连接外部网络，不使用 SSH，不安装依赖。
+8. 仅在当前授权 Workspace 内工作。
+9. 优先使用 Python 标准库。
+10. 所有输出必须具备确定性，重复执行得到相同的逻辑内容。
+
+只允许新增本轮依赖解析脚本和输出文件。
+
+## 五、Task A — Rule → Group Dependency Resolution
+
+### 目标
+
+补齐 261 条 Rule 直接引用但没有保留在 Primary Objects 中的 Group。
+
+### 要求
+
+1. 从 `filter/rules.json` 获取全部 Rule。
+2. 解析 `sourceObjectDetails` 和 `destinationObjectDetails`。
+3. 根据逗号拆分 Group Name。
+4. 去除首尾空白，忽略空名称。
+5. 去重后建立完整 Group 引用集合。
+6. 使用 `Object.name` 精确匹配原始 `objects.json`。
+7. 排除已经存在于 `filter/objects.json` 中的 Object。
+8. 将其余 Object 作为 Related Objects 单独导出。
+9. 保留原始 Object 完整字段，不修改内容。
+10. 不根据 `status`、`type` 或 `isDeleted` 擅自删除关联对象。
+
+预期：
+
+- Rule 引用不同 Group：269
+- Primary 中已存在：108
+- 需要补充的 Related Objects：161
+- 原始数据无法解析的 Group：0
+
+### 输出
+
+`filter/related_objects.json`
+
+仅包含依赖补充对象，不得混入已经存在于 Primary Dataset 中的 Object。
+
+建议保留 ESP 原始响应结构，并更新分页数量。
+
+### 验证
+
+必须确认：
+
+- Related Objects 与 Primary Objects 没有重复 Object ID。
+- 合并后可解析全部 Rule 直接引用的 Group。
+- Group Name 匹配无歧义。
+- 原始 Object 字段完全保留。
+- 输出中没有无关 Object。
+
+如果发现相同名称对应多个 Object 或引用冲突，停止自动关联，记录异常。
+
+## 六、Task B — Flow Evolution Dependency Resolution
+
+### 目标
+
+只针对当前 261 条 Rule 实际引用的 Flow，构建完整历史前驱链。
+
+### Step 1：解析 Rule Flow 引用
+
+读取 `filter/rules.json` 中的 `flowdbIds`。
+
+要求支持：
+
+- 单个数字 ID
+- 逗号分隔的多个数字 ID
+- 首尾空白
+
+对于包含范围表达式、非法字符或其他未知格式的值：
+
+- 保留原始值
+- 记录为未解析引用
+- 不擅自展开范围
+
+例如 Rule 7873、7869 的八个 Flow ID，应逐个解析并验证。
+
+多值引用的实际业务语义尚未由 ESP 最终确认，因此不得声称一条 Rule 业务上可以正式绑定多个 Flow。
+
+### Step 2：定位当前 Flow
+
+使用：
+
+`Rule.flowdbIds → Flow.flowid`
+
+建立关联。
+
+必须区分：
+
+- 在 Primary Flows 中找到。
+- 仅在原始 Flows 中找到。
+- 原始 Flows 中也不存在。
+- 引用格式无法确定。
+
+不得使用 Flow 的 `id` 字段。
+
+### Step 3：递归追溯历史
+
+从解析成功的 Rule 引用 Flow 出发：
+
+`Current Flow → oldFlowid → oldFlowid → ...`
+
+直到：
+
+- `oldFlowid` 为 null、空或经验证的无前驱标记。
+- 前驱在原始数据中不存在。
+- 发现循环引用。
+- 发现无法解析的历史引用。
+
+要求：
+
+1. 建立以 `flowid` 为主键的原始 Flow 索引。
+2. 检测重复 Flow ID。
+3. 递归或迭代遍历完整前驱链。
+4. 检测自引用和循环。
+5. 防止无限递归。
+6. 支持多个 Rule 共享同一 Flow。
+7. 对共享历史节点去重。
+8. 保留历史节点原始 Source/Destination EONID。
+9. 不因为历史 Flow 的 EONID 不属于 Team 而截断历史链。
+
+### Step 4：仅导出缺失依赖
+
+如果历史 Flow 已存在于 `filter/flows.json`，不重复导出。
+
+如果历史 Flow 仅存在于原始 `flows.json`，则加入：
+
+`filter/historical_flows.json`
+
+注意：
+
+- 不要从全部 1,088 条 Primary Flow 出发无差别追溯。
+- 必须从 261 条 Rule 的实际 Flow 引用出发。
+- 不要自动把 Flow 5554 加入结果，除非它确实能从某条 Rule 的 Flow 关联链到达。
+- 历史依赖只用于 Evolution，不表示它属于当前 Team Scope。
+
+### 验证
+
+至少输出：
+
+- Rule Flow 引用总次数
+- 去重后的起始 Flow 数量
+- 单值与复合引用数量
+- 所有可解析引用的匹配情况
+- 实际遍历的历史 Flow 数量
+- 最大历史链深度
+- 需要额外补充的历史 Flow 数量
+- 缺失前驱数量
+- 循环引用数量
+- 无法解析的引用数量
+
+不得在未完整遍历前驱链时宣称 Evolution 完整。
+
+## 七、Task C — Nested Group 数据能力审计
+
+这一步仅进行数据调查，不强制实现 Group 递归。
+
+已知：
+
+- `parentIds` 全部为 null
+- `childIds` 全部为 null
+- `ipAddresses` 全部为 string
+
+要求检查：
+
+1. `ipAddresses` 的实际存储格式。
+2. 是否存在明确的 Group 引用格式。
+3. 是否存在能够证明父子关系的其他字段。
+4. 是否能区分普通 IP、CIDR、IP Range 与 Group Reference。
+5. 是否有足够信息可靠地递归展开 Nested Group。
+
+不能仅根据字符串中出现 `grp-` 就断定是有效的父子关系。
+
+如果没有可靠证据：
+
+明确输出：
+
+`Nested Group hierarchy: NOT AVAILABLE IN CURRENT EXPORT`
+
+不要推测、自动生成或者伪造 Nested Group 关系。
+
+在审计报告中只提供格式特征和汇总统计，不输出完整 IP 列表。
+
+## 八、Task D — Relationship Integrity Audit
+
+生成：
+
+`filter/relationship_audit.json`
+
+至少包含以下部分：
+
+### 1. Primary Dataset
+
+记录已冻结的三个数据集数量及校验结果。
+
+### 2. Rule → Flow
+
+- Rule 总数
+- Flow 引用数量
+- 成功解析数量
+- 未解析数量
+- 复合引用数量
+- 缺失 Flow 数量
+
+### 3. Rule → Group
+
+- 不同 Group Name 数量
+- Primary 中找到的数量
+- Related 中找到的数量
+- 原始数据中缺失的数量
+- 同名冲突数量
+
+### 4. Flow Evolution
+
+- 起始 Flow 数量
+- 可追溯历史链数量
+- 额外历史节点数量
+- 最大深度
+- Missing Predecessors
+- Cycles
+- 其他异常
+
+### 5. Nested Group
+
+- parentIds / childIds 的可用性
+- ipAddresses 格式分析结果
+- 是否能够可靠地解析嵌套关系
+- 已确认的数据限制
+
+### 6. Overall Integrity
+
+每项检查明确输出：
+
+`PASS / WARNING / FAIL / NOT_VERIFIED`
+
+不要把部分关联成功直接总结成整体 PASS。
+
+对于尚未确认的复合 Flow 业务语义，保留 WARNING 或 NOT_VERIFIED。
+
+## 九、输出文件
+
+本轮仅新增：
+
+```text
+resolve_dependencies.py
+
+filter/
+    related_objects.json
+    historical_flows.json
+    relationship_audit.json
+
+FW-EXPLORER-02-HANDOFF.md
+```
+
+`resolve_dependencies.py` 必须：
+
+- 使用 Python 标准库。
+- 只读取原始和 Primary JSON。
+- 不修改任何输入。
+- 可重复运行。
+- 提供清晰的异常处理。
+- 使用稳定排序确保输出确定性。
+- 在缺少源文件、字段结构不符或发生严重数据冲突时明确报错。
+- 在写入前完成基础一致性检查。
+- 不打印内部 IP 地址和完整敏感记录。
+
+输出应保留足够完整的原始字段，供后续 Web Service 使用。
+
+## 十、验收标准
+
+### A. Input Preservation
+
+所有冻结输入文件 SHA-256 前后一致。
+
+### B. Primary Dataset
+
+必须仍然是：
+
+- Rules：261
+- Flows：1,088
+- Objects：162
+
+不得修改数量或内容。
+
+### C. Group Dependencies
+
+261 条 Rule 的全部直接 Group 引用均可在 Primary + Related Objects 中解析。
+
+预期 Related Objects 为 161 条。
+
+如果与预期不一致，必须解释原因。
+
+### D. Flow Dependencies
+
+所有可解析的 Rule → Flow 引用必须完成关联检查。
+
+从这些 Flow 出发的 `oldFlowid` 链必须完整遍历。
+
+原始数据不存在的前驱、循环引用和未知格式必须明确列出统计，不得隐瞒。
+
+### E. Data Quality
+
+- 不丢失原始业务字段。
+- 不伪造 Group 层级。
+- 不擅自改变 Flow 引用语义。
+- 不把历史依赖当成当前 Team Flow。
+- 不将所有 Group 或历史 Flow 无差别导出。
+- 不提前开始 Web Service 开发。
+
+### F. Independent Verification
+
+执行脚本后，使用独立于生成流程的检查逻辑，重新验证：
+
+- 输出 Object ID 是否都存在于原始数据。
+- 相关 Group 集合是否恰好等于 Primary 未覆盖的直接引用集合。
+- 历史 Flow 是否都能从 Rule 起始 Flow 沿前驱链到达。
+- 是否包含不必要的依赖记录。
+- 是否修改冻结输入。
+- 重复执行是否得到相同结果。
+
+未实际执行的检查必须标记 NOT RUN。
+
+## 十一、完成后交接
+
+编写中文：
+
+`FW-EXPLORER-02-HANDOFF.md`
+
+内容包括：
+
+1. 总结：PASS / PARTIAL / BLOCKED。
+2. 新增文件清单。
+3. 输入 SHA-256 保护结果。
+4. Rule → Group 补全结果。
+5. Rule → Flow 和历史链结果。
+6. Nested Group 数据调查结论。
+7. 实际执行的命令与验证结果。
+8. 发现的数据异常。
+9. 对后续数据库建模的建议。
+
+最后在 Windsurf 对话中提供简短中文总结。
+
+**完成本轮分析、实现和本地验证后立即停止。不得自动进入数据库设计、API 或 UI 开发。等待下一轮授权。**
