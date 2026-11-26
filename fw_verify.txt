@@ -1,19 +1,55 @@
-jq '
-  .data.requested_objects.list
-  | group_by(.name)
-  | map(select(length > 1))
+jq -n \
+  --slurpfile r filter/rules.json \
+  --slurpfile a objects.json '
+  def names:
+    (. // "")
+    | tostring
+    | split(",")
+    | map(gsub("^\\s+|\\s+$"; ""))
+    | map(select(length > 0))[];
+
+  (
+    [
+      $r[0].data.requested_rules.list[]
+      | (.sourceObjectDetails, .destinationObjectDetails)
+      | names
+    ] | unique
+  ) as $wanted
+
+  | [
+      $a[0].data.requested_objects.list[]
+      | select(.name as $n | $wanted | index($n) != null)
+    ] as $matched
+
   | {
-      duplicateNames: length,
-      recordsWithDuplicateNames: (map(length) | add // 0),
-      maxRecordsPerName: (map(length) | max // 0)
+      referencedGroupCount: ($wanted | length),
+      matchedObjectCount: ($matched | length),
+
+      byType: (
+        $matched
+        | group_by(.type)
+        | map({
+            type: .[0].type,
+            count: length
+          })
+      ),
+
+      byStatus: (
+        $matched
+        | group_by(.status)
+        | map({
+            status: .[0].status,
+            count: length
+          })
+      ),
+
+      byIsDeleted: (
+        $matched
+        | group_by(.isDeleted)
+        | map({
+            isDeleted: .[0].isDeleted,
+            count: length
+          })
+      )
     }
-' objects.json
-
-jq -r '
-  .data.requested_objects.list
-  | group_by(.type)[]
-  | [.[0].type, length]
-  | @tsv
-' objects.json
-
-
+'
