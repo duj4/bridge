@@ -2,132 +2,82 @@ jq -n \
   --slurpfile raw objects.json \
   --slurpfile p filter/objects.json \
   --slurpfile rel filter/related_objects.json '
+  def tokens($v):
+    (($v // "") | tostring
+    | split(",")
+    | map(gsub("^\\s+|\\s+$"; ""))
+    | map(select(length > 0)));
+
   ($raw[0].data.requested_objects.list) as $all
+
   | (
       $p[0].data.requested_objects.list
       + $rel[0].data.requested_objects.list
     ) as $scope
 
-  | (reduce $all[] as $o (
-      {};
-      .[$o.name] = $o
-    )) as $byName
+  | (reduce $all[] as $o ({}; .[$o.name] = $o)) as $byName
 
   | ([$scope[].id | tostring] | unique) as $scopeIds
 
   | [
-      $scope[] as $parent
-      | (
-          ($parent.ipAddresses // "")
-          | tostring
-          | split(",")
-          | map(gsub("^\\s+|\\s+$"; ""))
-          | .[]
-        ) as $token
-
-      | select($token | startswith("grp"))
-
-      | $byName[$token] as $child
+      $scope[]
+      | . as $parent
+      | tokens($parent.ipAddresses)[]
+      | select(startswith("grp"))
+      | . as $name
+      | $byName[$name] as $child
       | select($child != null)
+      | select(($scopeIds | index($child.id | tostring)) == null)
+      | $child
+    ] | unique_by(.id) as $missing
 
+  | [
+      $missing[]
+      | . as $parent
+      | tokens($parent.ipAddresses)[]
+      | select(startswith("grp"))
+      | . as $name
+      | $byName[$name] as $child
       | {
           parentId: $parent.id,
           parentName: $parent.name,
-          parentEonid: $parent.eonid,
-          childId: $child.id,
-          childName: $child.name,
-          childEonid: $child.eonid,
-          childInScope: (
-            ($scopeIds | index($child.id | tostring)) != null
+          childId: ($child.id // null),
+          childName: $name,
+          childEonid: ($child.eonid // null),
+          existsInRaw: ($child != null),
+          alreadyInScope: (
+            if $child == null then false
+            else ($scopeIds | index($child.id | tostring)) != null
+            end
           )
         }
-    ] as $edges
+    ] as $next
 
   | {
-      scopeObjects: ($scope | length),
+      currentMissingGroups: ($missing | length),
 
-      candidateEdgeInstances: ($edges | length),
+      nextLevelReferences: ($next | length),
 
-      uniqueParentChildEdges:
-        ([$edges[] | [.parentId, .childId]] | unique | length),
+      nextLevelUniqueGroups: (
+        [$next[].childId | select(. != null) | tostring]
+        | unique | length
+      ),
 
-      parentObjectsWithNestedGroups:
-        ([$edges[].parentId] | unique | length),
+      unresolvedGroupReferences: (
+        [$next[] | select(.existsInRaw | not)]
+        | length
+      ),
 
-      uniqueChildGroups:
-        ([$edges[].childId] | unique | length),
-
-      uniqueChildGroupsInScope:
-        ([$edges[] | select(.childInScope) | .childId] | unique | length),
-
-      uniqueChildGroupsOutsideScope:
-        ([$edges[] | select(.childInScope | not) | .childId] | unique | length),
-
-      examples: $edges[:10]
-    }
-'
-
-jq '
-  [
-    .data.requested_objects.list[]
-    | select((.flowid | tostring) == "98")
-  ] as $r
-
-  | {
-      recordCount: ($r | length),
-
-      uniqueFullRecords:
-        ($r | unique | length),
-
-      duplicateCopies:
-        (($r | length) - ($r | unique | length)),
-
-      fieldsWithDifferentValues: [
-        ($r[0] | keys_unsorted[]) as $k
+      newDependencies: [
+        $next[]
         | select(
-            ([$r[] | .[$k]] | unique | length) > 1
+            .existsInRaw
+            and (.alreadyInScope | not)
           )
-        | $k
-      ]
+      ],
+
+      examples: $next[:10]
     }
-' flows.json
-
-jq -n \
-  --slurpfile tr filter/rules.json \
-  --slurpfile ar rules.json \
-  --slurpfile tf filter/flows.json \
-  --slurpfile af flows.json '
-  def has98($v):
-    (($v // "") | tostring
-     | split(",")
-     | map(gsub("^\\s+|\\s+$"; ""))
-     | index("98")) != null;
-
-  {
-    teamRulesReferencing98: [
-      $tr[0].data.requested_rules.list[]
-      | select(has98(.flowdbIds))
-      | .id
-    ],
-
-    allRulesReferencing98: [
-      $ar[0].data.requested_rules.list[]
-      | select(has98(.flowdbIds))
-      | .id
-    ],
-
-    teamFlowsPointingTo98: [
-      $tf[0].data.requested_objects.list[]
-      | select((.oldFlowid | tostring) == "98")
-      | .flowid
-    ],
-
-    allFlowsPointingTo98: [
-      $af[0].data.requested_objects.list[]
-      | select((.oldFlowid | tostring) == "98")
-      | .flowid
-    ]
-  }
 '
 
 
