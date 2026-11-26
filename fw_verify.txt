@@ -1,68 +1,116 @@
+jq '
+  [
+    .data.requested_objects.list[]
+    | select(
+        (.flowid | tostring) == "6472"
+        or (.flowid | tostring) == "5554"
+      )
+    | {
+        flowid,
+        oldFlowid,
+        status,
+        sourceEonid,
+        destinationEonid,
+        sourceSecurityZone,
+        destinationSecurityZone
+      }
+  ]
+' flows.json
+
+jq --arg fid "6472" '
+  [
+    .data.requested_rules.list[]
+    | select(
+        (
+          (.flowdbIds // "")
+          | split(",")
+          | map(gsub("^\\s+|\\s+$"; ""))
+          | index($fid)
+        ) != null
+      )
+    | {
+        id,
+        status,
+        flowdbIds
+      }
+  ]
+' filter/rules.json
+
 jq -n \
   --slurpfile r filter/rules.json \
-  --slurpfile f filter/flows.json '
-  ([$f[0].data.requested_objects.list[].flowid | tostring]
-   | unique) as $ids
-
-  | [
-      $r[0].data.requested_rules.list[]
-      | select((.flowdbIds // "") | contains(","))
-      | {
-          ruleId: .id,
-          flowIds: (
-            .flowdbIds
-            | split(",")
-            | map(gsub("^\\s+|\\s+$"; ""))
-          )
-        }
-      | . + {
-          flowCount: (.flowIds | length),
-          missingFlowIds: [
-            .flowIds[]
-            | select(. as $id | $ids | index($id) == null)
-          ]
-        }
-    ]
-'
-
-jq -n \
-  --slurpfile f filter/flows.json '
-  def norm:
-    if . == null then ""
-    else tostring
-    end;
+  --slurpfile f filter/objects.json \
+  --slurpfile a objects.json '
+  def names:
+    (. // "")
+    | tostring
+    | split(",")
+    | map(gsub("^\\s+|\\s+$"; ""))
+    | map(select(length > 0));
 
   (
-    [$f[0].data.requested_objects.list[].flowid | norm]
-    | unique
-  ) as $ids
+    [
+      $r[0].data.requested_rules.list[]
+      | (.sourceObjectDetails, .destinationObjectDetails)
+      | names[]
+    ] | unique
+  ) as $wanted
 
-  | [
-      $f[0].data.requested_objects.list[]
-      | (.oldFlowid | norm) as $prev
-      | select(
-          $prev != ""
-          and $prev != "0"
-          and ($ids | index($prev)) == null
-        )
-      | {
-          flowid,
-          oldFlowid,
-          sourceEonid,
-          destinationEonid
-        }
-    ]
+  | (
+      [$f[0].data.requested_objects.list[].name
+       | select(. != null) | tostring]
+      | unique
+    ) as $kept
+
+  | (
+      [$a[0].data.requested_objects.list[].name
+       | select(. != null) | tostring]
+      | unique
+    ) as $all
+
+  | {
+      uniqueReferencedGroups: ($wanted | length),
+
+      foundInFiltered: (
+        [$wanted[]
+         | select(. as $x | ($kept | index($x)) != null)]
+        | length
+      ),
+
+      onlyInOriginal: (
+        [$wanted[]
+         | select(
+             . as $x |
+             ($kept | index($x)) == null
+             and ($all | index($x)) != null
+           )]
+        | length
+      ),
+
+      absentFromOriginal: (
+        [$wanted[]
+         | select(. as $x | ($all | index($x)) == null)]
+        | length
+      )
+    }
 '
 
-jq --arg id "这里替换成oldFlowid" '
-  .data.requested_objects.list[]
-  | select((.flowid | tostring) == $id)
+jq '
+  .data.requested_objects.list
   | {
-      flowid,
-      oldFlowid,
-      sourceEonid,
-      destinationEonid,
-      sourceSecurityZone,
-      destinationSecurityZone
+      parentIdsTypes: (
+        map(.parentIds | type)
+        | group_by(.)
+        | map({type: .[0], count: length})
+      ),
+      childIdsTypes: (
+        map(.childIds | type)
+        | group_by(.)
+        | map({type: .[0], count: length})
+      ),
+      ipAddressesTypes: (
+        map(.ipAddresses | type)
+        | group_by(.)
+        | map({type: .[0], count: length})
+      )
     }
-' flows.json
+' objects.json
