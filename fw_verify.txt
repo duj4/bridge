@@ -1,55 +1,29 @@
 jq -n \
   --slurpfile r filter/rules.json \
-  --slurpfile a objects.json '
+  --slurpfile o objects.json '
   def names:
     (. // "")
-    | tostring
     | split(",")
     | map(gsub("^\\s+|\\s+$"; ""))
     | map(select(length > 0))[];
 
-  (
-    [
-      $r[0].data.requested_rules.list[]
-      | (.sourceObjectDetails, .destinationObjectDetails)
-      | names
-    ] | unique
-  ) as $wanted
+  ([
+    $r[0].data.requested_rules.list[]
+    | (.sourceObjectDetails, .destinationObjectDetails)
+    | names
+  ] | unique) as $wanted
 
   | [
-      $a[0].data.requested_objects.list[]
+      $o[0].data.requested_objects.list[]
       | select(.name as $n | $wanted | index($n) != null)
-    ] as $matched
-
-  | {
-      referencedGroupCount: ($wanted | length),
-      matchedObjectCount: ($matched | length),
-
-      byType: (
-        $matched
-        | group_by(.type)
-        | map({
-            type: .[0].type,
-            count: length
-          })
-      ),
-
-      byStatus: (
-        $matched
-        | group_by(.status)
-        | map({
-            status: .[0].status,
-            count: length
-          })
-      ),
-
-      byIsDeleted: (
-        $matched
-        | group_by(.isDeleted)
-        | map({
-            isDeleted: .[0].isDeleted,
-            count: length
-          })
-      )
-    }
+      | select(.type == "DECO" or .status != "Active")
+      | {
+          id,
+          name,
+          eonid,
+          status,
+          type,
+          isDeleted
+        }
+    ]
 '
