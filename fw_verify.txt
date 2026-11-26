@@ -1,82 +1,68 @@
-重新验证 Rule → Flow → Previous Flow
-
 jq -n \
   --slurpfile r filter/rules.json \
-  --slurpfile f filter/flows.json \
-  --slurpfile a flows.json '
+  --slurpfile f filter/flows.json '
+  ([$f[0].data.requested_objects.list[].flowid | tostring]
+   | unique) as $ids
+
+  | [
+      $r[0].data.requested_rules.list[]
+      | select((.flowdbIds // "") | contains(","))
+      | {
+          ruleId: .id,
+          flowIds: (
+            .flowdbIds
+            | split(",")
+            | map(gsub("^\\s+|\\s+$"; ""))
+          )
+        }
+      | . + {
+          flowCount: (.flowIds | length),
+          missingFlowIds: [
+            .flowIds[]
+            | select(. as $id | $ids | index($id) == null)
+          ]
+        }
+    ]
+'
+
+jq -n \
+  --slurpfile f filter/flows.json '
   def norm:
     if . == null then ""
-    else tostring | gsub("^\\s+|\\s+$"; "")
+    else tostring
     end;
 
-  ($r[0].data.requested_rules.list) as $rs
-  | ($f[0].data.requested_objects.list) as $ff
-  | ($a[0].data.requested_objects.list) as $af
-
-  | ([$ff[].flowid | norm] | unique) as $kept
-  | ([$af[].flowid | norm] | unique) as $all
+  (
+    [$f[0].data.requested_objects.list[].flowid | norm]
+    | unique
+  ) as $ids
 
   | [
-      $rs[]
-      | {rule: .id, ref: (.flowdbIds | norm)}
-    ] as $refs
-
-  | [
-      $refs[]
-      | select(.ref | test("^[0-9]+$"))
-    ] as $simple
-
-  | [
-      $refs[]
-      | select((.ref | test("^[0-9]+$")) | not)
-    ] as $other
-
-  | [
-      $ff[]
-      | {flow: .flowid, prev: (.oldFlowid | norm)}
-      | select(.prev != "" and .prev != "0")
-    ] as $prev
-
-  | {
-      totalRules: ($rs | length),
-      singleIdRuleRefs: ($simple | length),
-      nonSingleIdRefs: ($other | length),
-      nonSingleIdExamples: ($other | .[:5]),
-
-      ruleRefsFoundInFiltered:
-        ([$simple[]
-          | select(.ref as $id | $kept | index($id) != null)
-        ] | length),
-
-      ruleRefsOnlyInOriginal:
-        ([$simple[]
-          | select(.ref as $id
-            | ($all | index($id) != null)
-              and ($kept | index($id) == null))
-        ] | length),
-
-      ruleRefsMissingInOriginal:
-        ([$simple[]
-          | select(.ref as $id | $all | index($id) == null)
-        ] | length),
-
-      flowsWithOldFlowid: ($prev | length),
-
-      previousFoundInFiltered:
-        ([$prev[]
-          | select(.prev as $id | $kept | index($id) != null)
-        ] | length),
-
-      previousOnlyInOriginal:
-        ([$prev[]
-          | select(.prev as $id
-            | ($all | index($id) != null)
-              and ($kept | index($id) == null))
-        ] | length),
-
-      previousMissingInOriginal:
-        ([$prev[]
-          | select(.prev as $id | $all | index($id) == null)
-        ] | length)
-    }
+      $f[0].data.requested_objects.list[]
+      | (.oldFlowid | norm) as $prev
+      | select(
+          $prev != ""
+          and $prev != "0"
+          and ($ids | index($prev)) == null
+        )
+      | {
+          flowid,
+          oldFlowid,
+          sourceEonid,
+          destinationEonid
+        }
+    ]
 '
+
+jq --arg id "这里替换成oldFlowid" '
+  .data.requested_objects.list[]
+  | select((.flowid | tostring) == $id)
+  | {
+      flowid,
+      oldFlowid,
+      sourceEonid,
+      destinationEonid,
+      sourceSecurityZone,
+      destinationSecurityZone
+    }
+' flows.json
