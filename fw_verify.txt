@@ -20,20 +20,30 @@ jq -n \
   | ([$scope[].id | tostring] | unique) as $scopeIds
 
   | [
-      $scope[]
-      | . as $parent
+      $scope[] as $parent
       | tokens($parent.ipAddresses)[]
       | select(startswith("grp"))
       | . as $name
       | $byName[$name] as $child
       | select($child != null)
-      | select(($scopeIds | index($child.id | tostring)) == null)
-      | $child
-    ] | unique_by(.id) as $missing
+      | {
+          parentId: $parent.id,
+          childId: $child.id
+        }
+    ] as $edges1
+
+  | ([$edges1[].childId | tostring] | unique) as $childIds
 
   | [
-      $missing[]
-      | . as $parent
+      $all[]
+      | select(
+          (.id | tostring) as $id
+          | $childIds | index($id) != null
+        )
+    ] as $level1
+
+  | [
+      $level1[] as $parent
       | tokens($parent.ipAddresses)[]
       | select(startswith("grp"))
       | . as $name
@@ -41,43 +51,34 @@ jq -n \
       | {
           parentId: $parent.id,
           parentName: $parent.name,
-          childId: ($child.id // null),
           childName: $name,
-          childEonid: ($child.eonid // null),
+          childId: ($child.id // null),
           existsInRaw: ($child != null),
-          alreadyInScope: (
+          childInScope: (
             if $child == null then false
             else ($scopeIds | index($child.id | tostring)) != null
             end
           )
         }
-    ] as $next
+    ] as $edges2
 
   | {
-      currentMissingGroups: ($missing | length),
-
-      nextLevelReferences: ($next | length),
-
-      nextLevelUniqueGroups: (
-        [$next[].childId | select(. != null) | tostring]
+      firstLevelChildGroups: ($level1 | length),
+      secondLevelReferenceInstances: ($edges2 | length),
+      secondLevelUniqueChildren: (
+        [$edges2[].childId | select(. != null) | tostring]
         | unique | length
       ),
-
-      unresolvedGroupReferences: (
-        [$next[] | select(.existsInRaw | not)]
+      unresolvedReferences: (
+        [$edges2[] | select(.existsInRaw | not)]
         | length
       ),
-
-      newDependencies: [
-        $next[]
-        | select(
-            .existsInRaw
-            and (.alreadyInScope | not)
-          )
-      ],
-
-      examples: $next[:10]
+      additionalDependencies: (
+        [$edges2[]
+         | select(.existsInRaw and (.childInScope | not))
+         | .childId | tostring]
+        | unique | length
+      ),
+      examples: $edges2[:10]
     }
 '
-
-
