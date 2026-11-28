@@ -50,3 +50,37 @@ jq --arg eonid "305899" '
       businessJustifications
     })
 ' raw/rules.json
+
+jq '
+  .data.requested_objects.list[]
+  | select(.flowid == 7807)
+  | {
+      flowid,
+      oldFlowid,
+      sourceEonid,
+      sourceApplicationName,
+      destinationEonid,
+      destinationApplicationName,
+      sourceSecurityZone,
+      destinationSecurityZone,
+      servicesAndPorts
+    }
+' raw/flows.json
+
+jq '
+  .data.requested_objects.list[]
+  | select(
+      .name == "grp-eon305899-shg-csi-nonprod-scrape-targets"
+      or
+      .name == "grp-eon305899-bjv-csi-nonprod-scrape-targets"
+    )
+  | {
+      id,
+      name,
+      eonid,
+      status,
+      type,
+      businessJustification
+    }
+' raw/objects.json
+
