@@ -1,17 +1,31 @@
-jq '
-  .nodes
-  | group_by(.type)
+jq --arg eonid "305899" '
+  [
+    .nodes[]
+    | select(.type == "RULE")
+    | .properties
+    | select(.sourceEonid == $eonid)
+  ]
+  | group_by(.sourceApplicationName)
   | map({
-      type: .[0].type,
-      fields: (
-        [.[] | to_entries[]
-         | {field: .key, kind: (.value | type)}]
-        | unique
-      ),
-      properties: (
-        [.[] | .properties | objects | to_entries[]
-         | {field: .key, kind: (.value | type)}]
-        | unique
-      )
+      applicationName: .[0].sourceApplicationName,
+      ruleCount: length,
+      ruleIds: (map(.id) | sort)
     })
 ' graph/node.json
+
+jq --arg eonid "305899" '
+  [
+    .nodes[]
+    | select(.type == "RULE")
+    | .properties
+    | select(.destinationEonid == $eonid)
+  ]
+  | group_by(.destinationApplicationName)
+  | map({
+      applicationName: .[0].destinationApplicationName,
+      ruleCount: length,
+      ruleIds: (map(.id) | sort)
+    })
+' graph/node.json
+
+
