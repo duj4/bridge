@@ -1,127 +1,17 @@
-python3 - <<'PY'
-import json
-import ipaddress
-from collections import Counter
-
-def load(path):
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
-
-paths = [
-    "filter/objects.json",
-    "filter/related_objects.json",
-    "filter/nested_objects.json",
-]
-
-groups = []
-for path in paths:
-    groups.extend(load(path)["data"]["requested_objects"]["list"])
-
-raw_names = {
-    obj["name"]
-    for obj in load("raw/objects.json")["data"]["requested_objects"]["list"]
-}
-
-expected = set()
-unresolved = []
-
-def classify(token):
-    try:
-        addr = ipaddress.ip_address(token)
-        return "GROUP_CONTAINS_IP", f"ip:{addr}"
-    except ValueError:
-        pass
-
-    if "/" in token:
-        try:
-            network = ipaddress.ip_network(token, strict=False)
-            return "GROUP_CONTAINS_CIDR", f"cidr:{network}"
-        except ValueError:
-            pass
-
-    if "-" in token:
-        try:
-            left, right = token.split("-", 1)
-            start = ipaddress.ip_address(left.strip())
-            end = ipaddress.ip_address(right.strip())
-
-            if start.version == end.version and int(start) <= int(end):
-                return (
-                    "GROUP_CONTAINS_IP_RANGE",
-                    f"ip-range:{start}-{end}"
-                )
-        except ValueError:
-            pass
-
-    return None
-
-for group in groups:
-    source = f"group:{group['id']}"
-
-    for value in (group.get("ipAddresses") or "").split(","):
-        token = value.strip()
-        if not token:
-            continue
-
-        if token in raw_names:
-            continue
-
-        result = classify(token)
-
-        if result is None:
-            unresolved.append(group["id"])
-            continue
-
-        edge_type, target = result
-        expected.add((source, target, edge_type))
-
-member_types = {
-    "GROUP_CONTAINS_IP",
-    "GROUP_CONTAINS_CIDR",
-    "GROUP_CONTAINS_IP_RANGE",
-}
-
-actual_edges = [
-    e for e in load("graph/edge.json")["edges"]
-    if e["type"] in member_types
-]
-
-actual = {
-    (e["source"], e["target"], e["type"])
-    for e in actual_edges
-}
-
-missing = expected - actual
-extra = actual - expected
-
-nodes = {
-    n["id"]: n["type"]
-    for n in load("graph/node.json")["nodes"]
-}
-
-target_types = {
-    "GROUP_CONTAINS_IP": "IP",
-    "GROUP_CONTAINS_CIDR": "CIDR",
-    "GROUP_CONTAINS_IP_RANGE": "IP_RANGE",
-}
-
-wrong_types = sum(
-    nodes.get(e["target"]) != target_types[e["type"]]
-    for e in actual_edges
-)
-
-result = {
-    "groupCount": len(groups),
-    "expectedMemberEdges": len(expected),
-    "actualMemberEdges": len(actual_edges),
-    "expectedByType": dict(Counter(x[2] for x in expected)),
-    "actualByType": dict(Counter(e["type"] for e in actual_edges)),
-    "missingEdges": len(missing),
-    "unexpectedEdges": len(extra),
-    "unresolvedTokens": len(unresolved),
-    "wrongTargetNodeTypes": wrong_types,
-    "exactMatch": expected == actual,
-}
-
-print(json.dumps(result, indent=2))
-PY
+jq '
+  .nodes
+  | group_by(.type)
+  | map({
+      type: .[0].type,
+      fields: (
+        [.[] | to_entries[]
+         | {field: .key, kind: (.value | type)}]
+        | unique
+      ),
+      properties: (
+        [.[] | .properties | objects | to_entries[]
+         | {field: .key, kind: (.value | type)}]
+        | unique
+      )
+    })
+' graph/node.json
