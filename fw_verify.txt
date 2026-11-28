@@ -28,4 +28,25 @@ jq --arg eonid "305899" '
     })
 ' graph/node.json
 
-
+jq --arg eonid "305899" '
+  .data.requested_rules.list
+  | map(
+      select(
+        .sourceEonid == $eonid
+        and .destinationEonid == $eonid
+        and .sourceApplicationName != .destinationApplicationName
+      )
+    )
+  | map({
+      id,
+      status,
+      sourceEonid,
+      sourceApplicationName,
+      sourceObjectDetails,
+      destinationEonid,
+      destinationApplicationName,
+      destinationObjectDetails,
+      flowdbIds,
+      businessJustifications
+    })
+' raw/rules.json
